@@ -67,6 +67,11 @@ type backgroundWorkerThread struct {
 	dummyContext           context.Context
 	isBootingScript        bool
 	failureCount           int
+
+	// stopFdWrite is the write end of THIS thread's stop pipe. Per-thread
+	// so pool workers (num > 1) can each be drained independently; the
+	// bg script uses the read end via frankenphp_get_worker_handle().
+	stopFdWrite atomic.Int32
 }
 
 func convertToBackgroundWorkerThread(thread *phpThread, worker *worker) {
@@ -97,9 +102,10 @@ func (handler *backgroundWorkerThread) context() context.Context {
 // drain is called by drainWorkerThreads (and thread.shutdown) right before
 // drainChan is closed. We close the stop-pipe's write end so the PHP worker
 // script, which is typically parked in stream_select on the read end, wakes
-// up and can finish its loop gracefully.
+// up and can finish its loop gracefully. Per-thread fd so pool workers
+// drain their threads independently.
 func (handler *backgroundWorkerThread) drain() {
-	if fd := handler.worker.backgroundStopFdWrite.Swap(-1); fd >= 0 {
+	if fd := handler.stopFdWrite.Swap(-1); fd >= 0 {
 		C.frankenphp_worker_close_fd(C.int(fd))
 	}
 }
@@ -157,7 +163,7 @@ func (handler *backgroundWorkerThread) setupScript() {
 
 	opts := append([]RequestOption(nil), handler.worker.requestOptions...)
 	C.frankenphp_set_worker_name(handler.thread.pinCString(strings.TrimPrefix(handler.worker.name, "m#")), C._Bool(true))
-	handler.worker.backgroundStopFdWrite.Store(int32(C.frankenphp_worker_get_stop_fd_write()))
+	handler.stopFdWrite.Store(int32(C.frankenphp_worker_get_stop_fd_write()))
 
 	fc, err := newDummyContext(
 		filepath.Base(handler.worker.fileName),
@@ -183,7 +189,7 @@ func (handler *backgroundWorkerThread) setupScript() {
 }
 
 func (handler *backgroundWorkerThread) afterScriptExecution(exitStatus int) {
-	handler.worker.backgroundStopFdWrite.Store(-1)
+	handler.stopFdWrite.Store(-1)
 	worker := handler.worker
 	handler.dummyFrankenPHPContext = nil
 	handler.dummyContext = nil

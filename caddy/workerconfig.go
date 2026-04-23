@@ -164,15 +164,10 @@ func unmarshalWorker(d *caddyfile.Dispenser) (workerConfig, error) {
 	}
 
 	if wc.Background {
-		if wc.Num > 1 {
-			return wc, d.Err(`"num" > 1 is not yet supported for background workers`)
-		}
-		// For named bg workers, max_threads is threads-per-worker (>1 not
-		// yet supported). For the catch-all (no name), it's the cap on
-		// lazy-started instance count, which is a legitimate user knob.
-		if wc.Name != "" && wc.MaxThreads > 1 {
-			return wc, d.Err(`"max_threads" > 1 is not yet supported for named background workers`)
-		}
+		// Named bg workers: num and max_threads mean "threads per worker"
+		// (pool size and pool cap). Catch-all bg workers: num is the pool
+		// size of the placeholder instance (usually 1), max_threads caps
+		// how many distinct names can be lazy-started.
 		if len(wc.MatchPath) != 0 {
 			return wc, d.Err(`"match" is not supported for background workers`)
 		}

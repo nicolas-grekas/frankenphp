@@ -38,7 +38,6 @@ type worker struct {
 	backgroundWorker       *backgroundWorkerState
 	backgroundRegistry     *backgroundWorkerRegistry
 	backgroundReserveOnce  sync.Once
-	backgroundStopFdWrite  atomic.Int32 // write end of the stop pipe, -1 if not set
 }
 
 var (
@@ -177,10 +176,10 @@ func newWorker(o workerOpt) (*worker, error) {
 		isBackgroundWorker:     o.isBackgroundWorker,
 	}
 
-	w.backgroundStopFdWrite.Store(-1)
 	// backgroundWorker state is reserved lazily via the registry at
 	// thread-setup time, not here; lazy-start callers set it directly
-	// and eager inits go through setupScript's sync.Once.
+	// and eager inits go through setupScript's sync.Once. The stop-pipe
+	// write fd is per-thread (handler field), not per-worker.
 
 	w.configureMercure(&o)
 
