@@ -51,6 +51,7 @@ type FrankenPHPModule struct {
 	preparedEnvNeedsReplacement bool
 	logger                      *slog.Logger
 	requestOptions              []frankenphp.RequestOption
+	backgroundScope             frankenphp.BackgroundScope
 }
 
 // CaddyModule returns the Caddy module information.
@@ -78,6 +79,14 @@ func (f *FrankenPHPModule) Provision(ctx caddy.Context) error {
 
 	f.assignMercureHub(ctx)
 
+	// Each php_server block gets its own background-worker scope so
+	// workers declared with the same name in different blocks don't
+	// collide. Provision can be called more than once for the same
+	// module; only assign once.
+	if f.backgroundScope == 0 {
+		f.backgroundScope = frankenphp.NextBackgroundWorkerScope()
+	}
+
 	loggerOpt := frankenphp.WithRequestLogger(f.logger)
 	for i, wc := range f.Workers {
 		// make the file path absolute from the public directory
@@ -92,6 +101,7 @@ func (f *FrankenPHPModule) Provision(ctx caddy.Context) error {
 		}
 
 		wc.requestOptions = append(wc.requestOptions, loggerOpt)
+		wc.options = append(wc.options, frankenphp.WithWorkerBackgroundScope(f.backgroundScope))
 		f.Workers[i] = wc
 	}
 
@@ -241,6 +251,7 @@ func (f *FrankenPHPModule) ServeHTTP(w http.ResponseWriter, r *http.Request, _ c
 			opts,
 			frankenphp.WithOriginalRequest(new(ctx.Value(caddyhttp.OriginalRequestCtxKey).(http.Request))),
 			frankenphp.WithWorkerName(workerName),
+			frankenphp.WithRequestBackgroundScope(f.backgroundScope),
 		)...,
 	)
 

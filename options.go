@@ -51,6 +51,7 @@ type workerOpt struct {
 	onServerStartup        func()
 	onServerShutdown       func()
 	isBackgroundWorker     bool
+	backgroundScope        BackgroundScope
 }
 
 // WithContext sets the main context to use.
@@ -266,6 +267,19 @@ func WithWorkerOnServerShutdown(f func()) WorkerOption {
 func WithWorkerBackground() WorkerOption {
 	return func(w *workerOpt) error {
 		w.isBackgroundWorker = true
+
+		return nil
+	}
+}
+
+// EXPERIMENTAL: WithWorkerBackgroundScope assigns this worker to a given
+// background-worker scope. Workers in the same scope share a background
+// lookup; each php_server block gets its own scope so workers with the
+// same name in different blocks don't collide. The zero value is the
+// global/embed scope and is the default.
+func WithWorkerBackgroundScope(scope BackgroundScope) WorkerOption {
+	return func(w *workerOpt) error {
+		w.backgroundScope = scope
 
 		return nil
 	}

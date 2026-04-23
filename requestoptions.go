@@ -154,6 +154,17 @@ func WithRequestLogger(logger *slog.Logger) RequestOption {
 	}
 }
 
+// WithRequestBackgroundScope selects the background-worker scope for
+// ensure/get_vars calls made from this request. Used by the Caddy module
+// so each php_server block resolves its own set of background workers.
+func WithRequestBackgroundScope(scope BackgroundScope) RequestOption {
+	return func(o *frankenPHPContext) error {
+		o.backgroundScope = scope
+
+		return nil
+	}
+}
+
 // WithWorkerName sets the worker that should handle the request
 func WithWorkerName(name string) RequestOption {
 	return func(o *frankenPHPContext) error {

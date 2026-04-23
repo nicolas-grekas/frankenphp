@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -17,10 +18,25 @@ import (
 // number of distinct lazy-started instances from a single catch-all.
 const defaultMaxBackgroundWorkers = 16
 
-// backgroundLookup is the registry that resolves a worker name to either
-// a named declaration or the catch-all. Single global scope in this step;
-// step 6 replaces this with a per-php_server scope map.
-var backgroundLookup *backgroundWorkerLookup
+// BackgroundScope identifies an isolation boundary for background workers.
+// Each php_server block uses a distinct scope so that two blocks can
+// declare workers with the same name without conflict. The zero value is
+// the global/embed scope (used when no per-block scope was assigned).
+// Representation is opaque; obtain values via NextBackgroundWorkerScope.
+type BackgroundScope int
+
+var backgroundScopeCounter atomic.Uint64
+
+// NextBackgroundWorkerScope returns a unique scope for background worker
+// isolation. Each php_server block should call this once during
+// provisioning.
+func NextBackgroundWorkerScope() BackgroundScope {
+	return BackgroundScope(backgroundScopeCounter.Add(1))
+}
+
+// backgroundLookups maps scopes to their background worker lookup.
+// Scope 0 is the global/embed scope; each php_server block gets its own.
+var backgroundLookups map[BackgroundScope]*backgroundWorkerLookup
 
 // backgroundWorkerLookup maps worker names to their registry, with a
 // separate slot for the catch-all (name-less) declaration.
@@ -57,11 +73,22 @@ type backgroundWorkerRegistry struct {
 	workers map[string]*backgroundWorkerState
 
 	// Template options preserved so lazy-started workers inherit the same
-	// env/watch/failure policy as their eagerly-started siblings.
+	// scope/env/watch/failure policy as their eagerly-started siblings.
+	scope                  BackgroundScope
 	env                    PreparedEnv
 	watch                  []string
 	maxConsecutiveFailures int
 	requestOptions         []RequestOption
+
+	// declaredWorker is the pre-existing *worker struct for a named
+	// declaration (num=0 lazy or num>=1 eager). It lets the lazy-start
+	// path reuse this worker instead of scanning the global
+	// workersByName map, which is not scope-aware: scoped bg workers
+	// with the same user-facing name would otherwise collide into a
+	// single *worker and overwrite each other's live state pointers.
+	// nil for catch-all registries (each lazy-started name gets a
+	// fresh worker).
+	declaredWorker *worker
 }
 
 func newBackgroundWorkerRegistry(entrypoint string) *backgroundWorkerRegistry {
@@ -115,33 +142,64 @@ func (registry *backgroundWorkerRegistry) abortStart(name string, bgw *backgroun
 	bgw.abort(err)
 }
 
-// buildBackgroundWorkerLookup constructs the name->registry map + catch-all
-// slot from declared worker options. Each declaration gets its own registry
-// so shared-entrypoint declarations keep their own template options.
-func buildBackgroundWorkerLookup(workers []*worker, opts []workerOpt) *backgroundWorkerLookup {
-	var lookup *backgroundWorkerLookup
+// buildBackgroundWorkerLookups constructs a scope->lookup map from declared
+// worker options. Each scope (php_server block, or 0 for global/embed)
+// gets its own lookup so workers declared with the same name in different
+// blocks don't collide. Each declaration gets its own registry so shared-
+// entrypoint declarations keep their own template options.
+func buildBackgroundWorkerLookups(workers []*worker, opts []workerOpt) map[BackgroundScope]*backgroundWorkerLookup {
+	lookups := make(map[BackgroundScope]*backgroundWorkerLookup)
 
 	for i, o := range opts {
 		if !o.isBackgroundWorker {
 			continue
 		}
-		if lookup == nil {
+
+		scope := o.backgroundScope
+		lookup, ok := lookups[scope]
+		if !ok {
 			lookup = newBackgroundWorkerLookup()
+			lookups[scope] = lookup
 		}
 
-		registry := newBackgroundWorkerRegistry(o.fileName)
+		w := workers[i]
+		// Use the worker's normalized filename (EvalSymlinks + FastAbs
+		// from newWorker) instead of the raw o.fileName so lazy-start
+		// from a catch-all resolves the same entrypoint even if cwd or
+		// the symlink target changes after init.
+		registry := newBackgroundWorkerRegistry(w.fileName)
+		registry.scope = scope
 		registry.env = o.env
 		registry.watch = o.watch
 		registry.maxConsecutiveFailures = o.maxConsecutiveFailures
 		registry.requestOptions = o.requestOptions
 
-		w := workers[i]
+		w.backgroundScope = scope
 		phpName := strings.TrimPrefix(w.name, "m#")
 		if phpName != "" && phpName != w.fileName {
 			if o.num > 0 {
 				registry.num = o.num
 			}
 			lookup.byName[phpName] = registry
+			// Named declaration: remember the *worker so lazy-start can
+			// reuse it instead of scanning workersByName.
+			registry.declaredWorker = w
+
+			// Pre-reserve the live state for eager (num >= 1) named
+			// declarations: the worker thread created by initWorkers
+			// will reserve it in setupScript, but any ensure_background_worker
+			// call from an HTTP worker bootstrap that races ahead of
+			// setupScript would otherwise see a missing entry and
+			// lazy-start a duplicate. Reserving here makes the race
+			// impossible; setupScript picks up the existing state.
+			if o.num > 0 {
+				bgw := &backgroundWorkerState{
+					ready:   make(chan struct{}),
+					aborted: make(chan struct{}),
+				}
+				registry.workers[phpName] = bgw
+				w.backgroundWorker = bgw
+			}
 		} else {
 			maxW := defaultMaxBackgroundWorkers
 			if o.maxThreads > 1 {
@@ -149,25 +207,66 @@ func buildBackgroundWorkerLookup(workers []*worker, opts []workerOpt) *backgroun
 			}
 			registry.maxWorkers = maxW
 			lookup.catchAll = registry
+			// Catch-all declarations are strictly lazy-started: each
+			// ensure() with an unmatched name spawns its own threads on
+			// demand. Force num to 0 so initWorkers does not create
+			// eager placeholder threads that would call reserve() under
+			// the catch-all's own filename and consume one of the cap
+			// slots before any real lazy-start happens.
+			w.num = 0
 		}
 
 		w.backgroundRegistry = registry
 	}
 
-	return lookup
+	if len(lookups) == 0 {
+		return nil
+	}
+	return lookups
+}
+
+// getLookup returns the background-worker lookup for the given thread.
+// The scope is resolved from the thread's handler (for worker threads
+// inheriting their worker's scope) or from the request context (for
+// regular HTTP threads with WithRequestBackgroundScope).
+//
+// If the resolved scope has no workers declared (its lookup is nil), the
+// caller falls through to the global/embed scope (0) so that globally-
+// declared workers remain reachable from scoped requests. Scopes that
+// declared their own workers stay strictly isolated because their lookup
+// is non-nil.
+func getLookup(thread *phpThread) *backgroundWorkerLookup {
+	if backgroundLookups == nil {
+		return nil
+	}
+	var scope BackgroundScope
+	if handler, ok := thread.handler.(*workerThread); ok {
+		scope = handler.worker.backgroundScope
+	} else if handler, ok := thread.handler.(*backgroundWorkerThread); ok {
+		scope = handler.worker.backgroundScope
+	} else if fc, ok := fromContext(thread.context()); ok {
+		scope = fc.backgroundScope
+	}
+	if scope != 0 {
+		if l := backgroundLookups[scope]; l != nil {
+			return l
+		}
+	}
+	return backgroundLookups[0]
 }
 
 // startBackgroundWorker lazy-starts the named worker if it is not already
 // running. Safe to call concurrently; only the first caller actually
 // starts the worker, the rest observe the existing state.
-func startBackgroundWorker(bgWorkerName string) error {
+func startBackgroundWorker(thread *phpThread, bgWorkerName string) error {
 	if bgWorkerName == "" {
 		return fmt.Errorf("background worker name must not be empty")
 	}
-	if backgroundLookup == nil {
+	lookup := getLookup(thread)
+	if lookup == nil {
 		return fmt.Errorf("no background worker configured")
 	}
-	registry := backgroundLookup.Resolve(bgWorkerName)
+	registry := lookup.Resolve(bgWorkerName)
 	if registry == nil || registry.entrypoint == "" {
 		return fmt.Errorf("no background worker configured for name %q", bgWorkerName)
 	}
@@ -185,13 +284,20 @@ func startBackgroundWorkerWithRegistry(registry *backgroundWorkerRegistry, bgWor
 
 	numThreads := registry.maxThreads()
 
-	// A num=0 named declaration already created a worker struct at init
-	// time; reuse it instead of creating a duplicate. For catch-all
-	// instances (different names, different worker structs), create fresh.
+	// Named declarations (num=0 lazy or num>=1 eager) already have a
+	// pre-existing *worker struct recorded on the registry. Reuse it so
+	// lazy-start doesn't create a duplicate and - crucially for per-
+	// php_server isolation - doesn't route through the global
+	// workersByName map, which is scope-agnostic and would make two
+	// scopes sharing a user-facing name collide into the same *worker.
+	// Catch-all registries leave declaredWorker nil so each lazy-started
+	// name gets a fresh worker struct of its own.
 	var w *worker
-	if existing := workersByName[bgWorkerName]; existing != nil && existing.isBackgroundWorker {
-		w = existing
+	freshWorker := false
+	if registry.declaredWorker != nil {
+		w = registry.declaredWorker
 	} else {
+		freshWorker = true
 		// Clone env and slices: newWorker mutates env (writes
 		// FRANKENPHP_WORKER) and appends to requestOptions, so sharing
 		// these across lazy-started instances would race with HTTP
@@ -208,6 +314,7 @@ func startBackgroundWorkerWithRegistry(registry *backgroundWorkerRegistry, bgWor
 			fileName:               registry.entrypoint,
 			num:                    numThreads,
 			isBackgroundWorker:     true,
+			backgroundScope:        registry.scope,
 			env:                    env,
 			watch:                  watch,
 			maxConsecutiveFailures: registry.maxConsecutiveFailures,
@@ -224,6 +331,10 @@ func startBackgroundWorkerWithRegistry(registry *backgroundWorkerRegistry, bgWor
 	w.isBackgroundWorker = true
 	w.backgroundWorker = bgw
 	w.backgroundRegistry = registry
+	// Redundant with newWorker's backgroundScope opt for fresh workers,
+	// but necessary for declared workers whose scope is set on the
+	// registry rather than on the workerOpt struct.
+	w.backgroundScope = registry.scope
 
 	for i := 0; i < numThreads; i++ {
 		t := getInactivePHPThread()
@@ -240,12 +351,14 @@ func startBackgroundWorkerWithRegistry(registry *backgroundWorkerRegistry, bgWor
 				slog.Int("attached", i))
 			break
 		}
-		if i == 0 && workersByName[bgWorkerName] != w {
-			// Freshly-created worker: register it and add to the global list.
+		if i == 0 && freshWorker {
+			// Freshly-created catch-all instance: add to the global list so
+			// RestartWorkers/DrainWorkers iterate it. Intentionally NOT
+			// registered in workersByName - bg workers are resolved per-
+			// scope via backgroundLookups, not via the global name map.
 			scalingMu.Lock()
 			workers = append(workers, w)
 			scalingMu.Unlock()
-			workersByName[bgWorkerName] = w
 		}
 		convertToBackgroundWorkerThread(t, w)
 	}
@@ -283,17 +396,17 @@ func isBootstrapEnsure(thread *phpThread) bool {
 //export go_frankenphp_ensure_background_worker
 func go_frankenphp_ensure_background_worker(threadIndex C.uintptr_t, name *C.char, nameLen C.size_t, timeoutMs C.int) *C.char {
 	thread := phpThreads[threadIndex]
-	if backgroundLookup == nil {
+	lookup := getLookup(thread)
+	if lookup == nil {
 		return C.CString("no background worker configured")
 	}
 
 	goName := C.GoStringN(name, C.int(nameLen))
 	bootstrap := isBootstrapEnsure(thread)
-
-	if err := startBackgroundWorker(goName); err != nil {
+	if err := startBackgroundWorker(thread, goName); err != nil {
 		return C.CString(err.Error())
 	}
-	registry := backgroundLookup.Resolve(goName)
+	registry := lookup.Resolve(goName)
 	if registry == nil {
 		return C.CString("background worker not found: " + goName)
 	}
@@ -386,13 +499,15 @@ func go_frankenphp_set_vars(threadIndex C.uintptr_t, varsPtr unsafe.Pointer, old
 // ensure() first, this returns a "not ready" error.
 //
 //export go_frankenphp_get_vars
-func go_frankenphp_get_vars(name *C.char, nameLen C.size_t, returnValue *C.zval) *C.char {
-	if backgroundLookup == nil {
+func go_frankenphp_get_vars(threadIndex C.uintptr_t, name *C.char, nameLen C.size_t, returnValue *C.zval) *C.char {
+	thread := phpThreads[threadIndex]
+	lookup := getLookup(thread)
+	if lookup == nil {
 		return C.CString("no background worker configured")
 	}
 
 	goName := C.GoStringN(name, C.int(nameLen))
-	registry := backgroundLookup.Resolve(goName)
+	registry := lookup.Resolve(goName)
 	if registry == nil {
 		return C.CString("background worker not found: " + goName + " (call frankenphp_ensure_background_worker first)")
 	}

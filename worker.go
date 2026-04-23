@@ -34,6 +34,7 @@ type worker struct {
 	onThreadShutdown       func(int)
 	queuedRequests         atomic.Int32
 	isBackgroundWorker     bool
+	backgroundScope        BackgroundScope
 	backgroundWorker       *backgroundWorkerState
 	backgroundRegistry     *backgroundWorkerRegistry
 	backgroundReserveOnce  sync.Once
@@ -70,15 +71,20 @@ func initWorkers(opt []workerOpt) error {
 
 		totalThreadsToStart += w.num
 		workers = append(workers, w)
-		workersByName[w.name] = w
+		// Background workers are resolved per-scope via backgroundLookups
+		// so the same user-facing name can appear in multiple scopes
+		// without colliding in the global workersByName map.
+		if !w.isBackgroundWorker {
+			workersByName[w.name] = w
+		}
 		if w.allowPathMatching {
 			workersByPath[w.fileName] = w
 		}
 	}
 
-	// Build the lookup (named + catch-all) and attach each bg worker to
-	// its registry so lazy-start siblings inherit the template options.
-	backgroundLookup = buildBackgroundWorkerLookup(workers, opt)
+	// Build the per-scope lookups (named + catch-all per scope). Each
+	// php_server block gets its own scope; the global/embed scope is 0.
+	backgroundLookups = buildBackgroundWorkerLookups(workers, opt)
 
 	startupFailChan = make(chan error, totalThreadsToStart)
 
@@ -142,8 +148,13 @@ func newWorker(o workerOpt) (*worker, error) {
 	if w := workersByPath[absFileName]; w != nil && allowPathMatching {
 		return w, fmt.Errorf("two workers cannot have the same filename: %q", absFileName)
 	}
-	if w := workersByName[o.name]; w != nil {
-		return w, fmt.Errorf("two workers cannot have the same name: %q", o.name)
+	// Background workers are resolved through per-scope lookups, not the
+	// global workersByName map; the same user-facing name can appear in
+	// multiple php_server scopes without collision.
+	if !o.isBackgroundWorker {
+		if w := workersByName[o.name]; w != nil {
+			return w, fmt.Errorf("two workers cannot have the same name: %q", o.name)
+		}
 	}
 
 	if o.env == nil {

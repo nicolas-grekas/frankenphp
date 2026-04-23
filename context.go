@@ -38,6 +38,10 @@ type frankenPHPContext struct {
 	handlerParameters  any
 	handlerReturn      any
 
+	// backgroundScope selects the per-php_server background worker lookup
+	// for ensure/get_vars calls made from this request.
+	backgroundScope BackgroundScope
+
 	done      chan any
 	startedAt time.Time
 }
