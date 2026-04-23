@@ -231,6 +231,7 @@ void frankenphp_set_worker_name(char *name, bool background);
 int frankenphp_worker_get_stop_fd_write(void);
 void frankenphp_worker_close_fd(int fd);
 void frankenphp_copy_persistent_vars(zval *dst, void *persistent_ht);
+char *frankenphp_get_last_php_error(void);
 
 void register_extensions(zend_module_entry **m, int len);
 

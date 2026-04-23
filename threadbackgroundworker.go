@@ -28,15 +28,32 @@ type backgroundWorkerState struct {
 	ready       chan struct{}
 	readyOnce   sync.Once
 
+	// aborted is closed when the start sequence is abandoned before the
+	// worker reaches ready, so concurrent ensure waiters that already
+	// captured the state don't hang until their deadline.
+	aborted   chan struct{}
+	abortOnce sync.Once
+	abortErr  string
+
 	// bootFailure is set when the worker fails before reaching set_vars.
-	// Used to surface actionable errors in logs and future error messages.
+	// Ensure's bootstrap mode polls this alongside ready/aborted/deadline.
 	bootFailure atomic.Pointer[bootFailureInfo]
+}
+
+// abort signals ensure waiters that the start sequence has been abandoned.
+// Idempotent: repeated calls are no-ops.
+func (sk *backgroundWorkerState) abort(err error) {
+	sk.abortOnce.Do(func() {
+		sk.abortErr = err.Error()
+		close(sk.aborted)
+	})
 }
 
 type bootFailureInfo struct {
 	entrypoint   string
 	exitStatus   int
 	failureCount int
+	phpError     string // captured PG(last_error_*) before php_request_shutdown cleared it
 }
 
 // backgroundWorkerThread handles background worker scripts. Owns its own
@@ -123,6 +140,19 @@ func (handler *backgroundWorkerThread) beforeScriptExecution() string {
 }
 
 func (handler *backgroundWorkerThread) setupScript() {
+	// Reserve the shared state from the registry on first setup. For lazy
+	// starts this has already been done by startBackgroundWorkerWithRegistry;
+	// for eager inits it runs here. sync.Once lets pool workers (num > 1)
+	// share the same reservation.
+	handler.worker.backgroundReserveOnce.Do(func() {
+		if handler.worker.backgroundWorker == nil && handler.worker.backgroundRegistry != nil {
+			bgw, _, err := handler.worker.backgroundRegistry.reserve(strings.TrimPrefix(handler.worker.name, "m#"))
+			if err == nil {
+				handler.worker.backgroundWorker = bgw
+			}
+		}
+	})
+
 	metrics.StartWorker(handler.worker.name)
 
 	opts := append([]RequestOption(nil), handler.worker.requestOptions...)
@@ -183,14 +213,20 @@ func (handler *backgroundWorkerThread) afterScriptExecution(exitStatus int) {
 		return
 	}
 
-	// Boot failure: capture the failure info so a future get_vars-style
-	// call can surface it; log the condition and back off before the
-	// next attempt.
+	// Boot failure: capture the failure info (including PG(last_error_*)
+	// via a C-side TLS grab done before php_request_shutdown cleared it)
+	// so ensure's bootstrap mode can surface the actionable cause.
 	if worker.backgroundWorker != nil {
+		var phpError string
+		if cErr := C.frankenphp_get_last_php_error(); cErr != nil {
+			phpError = C.GoString(cErr)
+			C.free(unsafe.Pointer(cErr))
+		}
 		worker.backgroundWorker.bootFailure.Store(&bootFailureInfo{
 			entrypoint:   worker.fileName,
 			exitStatus:   exitStatus,
 			failureCount: handler.failureCount + 1,
+			phpError:     phpError,
 		})
 	}
 

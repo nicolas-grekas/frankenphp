@@ -157,18 +157,49 @@ func Config() PHPConfig {
 func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 	maxProcs := runtime.GOMAXPROCS(0) * 2
 	maxThreadsFromWorkers := 0
+	reservedThreads := 0
 
 	for i, w := range opt.workers {
-		if w.num <= 0 {
-			if w.isBackgroundWorker {
-				// Background workers default to a single thread; they're
-				// declared explicitly per worker and don't benefit from the
-				// HTTP-worker default of scaling to 2 * GOMAXPROCS.
-				opt.workers[i].num = 1
-			} else {
-				// https://github.com/php/frankenphp/issues/126
-				opt.workers[i].num = maxProcs
+		if w.isBackgroundWorker {
+			// Background workers default to one eager thread. For catch-all
+			// declarations, max_threads is the cap on lazy-started instances;
+			// reserve room for each so ensure() has a slot to schedule into.
+			// Bg workers are accounted for via reservedThreads only so they
+			// don't double-count against HTTP worker admission checks.
+			if w.maxThreads == 0 && w.num == 0 {
+				// Distinguish catch-all (no name / name == file) from a
+				// named lazy worker. Catch-all can host up to
+				// defaultMaxBackgroundWorkers distinct lazy-started names,
+				// so the thread budget must reserve that many slots;
+				// otherwise the second ensure() falls through to
+				// "no available PHP thread" long before hitting the
+				// advertised cap.
+				phpName := strings.TrimPrefix(w.name, "m#")
+				if phpName == "" || phpName == w.fileName {
+					opt.workers[i].maxThreads = defaultMaxBackgroundWorkers
+				} else {
+					opt.workers[i].maxThreads = 1
+				}
 			}
+			extra := w.num
+			if extra < 1 {
+				extra = 1
+			}
+			if w.maxThreads > extra {
+				extra = w.maxThreads
+			}
+			reservedThreads += extra
+			// Register the expected worker count for metrics too: without
+			// this, a bg-worker-only deployment never initialises
+			// totalWorkers, and every StartWorker/ReadyWorker call inside
+			// threadbackgroundworker.go becomes a silent no-op.
+			metrics.TotalWorkers(w.name, extra)
+			continue
+		}
+
+		if w.num <= 0 {
+			// https://github.com/php/frankenphp/issues/126
+			opt.workers[i].num = maxProcs
 		}
 		metrics.TotalWorkers(w.name, w.num)
 
@@ -207,7 +238,9 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 			return 0, fmt.Errorf("num_threads (%d) must be greater than the number of worker threads (%d)", opt.numThreads, numWorkers)
 		}
 
-		return numWorkers, nil
+		opt.numThreads += reservedThreads
+		opt.maxThreads += reservedThreads
+		return numWorkers + reservedThreads, nil
 	}
 
 	if maxThreadsIsSet && !numThreadsIsSet {
@@ -216,7 +249,9 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 			return 0, fmt.Errorf("max_threads (%d) must be greater than the number of worker threads (%d)", opt.maxThreads, numWorkers)
 		}
 
-		return numWorkers, nil
+		opt.numThreads += reservedThreads
+		opt.maxThreads += reservedThreads
+		return numWorkers + reservedThreads, nil
 	}
 
 	if !numThreadsIsSet {
@@ -228,7 +263,9 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 		}
 		opt.maxThreads = opt.numThreads
 
-		return numWorkers, nil
+		opt.numThreads += reservedThreads
+		opt.maxThreads += reservedThreads
+		return numWorkers + reservedThreads, nil
 	}
 
 	// both num_threads and max_threads are set
@@ -240,7 +277,9 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 		return 0, fmt.Errorf("max_threads (%d) must be greater than or equal to num_threads (%d)", opt.maxThreads, opt.numThreads)
 	}
 
-	return numWorkers, nil
+	opt.numThreads += reservedThreads
+	opt.maxThreads += reservedThreads
+	return numWorkers + reservedThreads, nil
 }
 
 // Init starts the PHP runtime and the configured workers.

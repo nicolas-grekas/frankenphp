@@ -56,6 +56,13 @@ function mercure_publish(string|array $topics, string $data = '', bool $private 
 function frankenphp_log(string $message, int $level = 0, array $context = []): void {}
 
 /**
+ * Declare a dependency on the named background worker. Lazy-starts it if
+ * it is not already running, then blocks until it has published its vars
+ * (set_vars) or the timeout expires. Timeout is in seconds.
+ */
+function frankenphp_ensure_background_worker(string $name, float $timeout = 30.0): void {}
+
+/**
  * Publish the given vars from a background worker. Only callable from a
  * worker started with the `background` flag. Values must be null, scalars,
  * arrays of allowed values, or enum cases.

@@ -91,6 +91,7 @@ __thread bool is_background_worker = false;
 __thread char *worker_name = NULL;
 __thread int worker_stop_fds[2] = {-1, -1};
 __thread php_stream *worker_signaling_stream = NULL;
+__thread char *captured_last_php_error = NULL;
 __thread HashTable *sandboxed_env = NULL;
 
 #ifndef PHP_WIN32
@@ -298,6 +299,39 @@ void frankenphp_copy_persistent_vars(zval *dst, void *persistent_ht) {
   zval src;
   ZVAL_ARR(&src, (HashTable *)persistent_ht);
   persistent_zval_to_request(dst, &src);
+}
+
+/* Capture PG(last_error_*) into the thread-local captured_last_php_error.
+ * Called before php_request_shutdown, which clears PG(last_error_*).
+ * Format: "<message> in <file> on line <line>". */
+static void frankenphp_capture_last_php_error(void) {
+  if (captured_last_php_error != NULL) {
+    free(captured_last_php_error);
+    captured_last_php_error = NULL;
+  }
+  if (PG(last_error_message) == NULL) {
+    return;
+  }
+  const char *msg = ZSTR_VAL(PG(last_error_message));
+  size_t msg_len = ZSTR_LEN(PG(last_error_message));
+  const char *file =
+      PG(last_error_file) ? ZSTR_VAL(PG(last_error_file)) : "unknown";
+  size_t file_len = PG(last_error_file) ? ZSTR_LEN(PG(last_error_file)) : 7;
+  int line = PG(last_error_lineno);
+  size_t buf_len = msg_len + file_len + 32;
+  captured_last_php_error = malloc(buf_len);
+  if (captured_last_php_error != NULL) {
+    snprintf(captured_last_php_error, buf_len, "%.*s in %.*s on line %d",
+             (int)msg_len, msg, (int)file_len, file, line);
+  }
+}
+
+/* Return and take ownership of the captured error; caller frees with
+ * C.free. NULL if nothing was captured. */
+char *frankenphp_get_last_php_error(void) {
+  char *s = captured_last_php_error;
+  captured_last_php_error = NULL;
+  return s;
 }
 
 static void frankenphp_update_request_context() {
@@ -968,6 +1002,32 @@ PHP_FUNCTION(frankenphp_get_vars) {
   }
 }
 
+PHP_FUNCTION(frankenphp_ensure_background_worker) {
+  zend_string *name = NULL;
+  double timeout = 30.0;
+
+  ZEND_PARSE_PARAMETERS_START(1, 2);
+  Z_PARAM_STR(name);
+  Z_PARAM_OPTIONAL;
+  Z_PARAM_DOUBLE(timeout);
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (timeout < 0) {
+    zend_value_error("frankenphp_ensure_background_worker(): timeout must be "
+                     "non-negative");
+    RETURN_THROWS();
+  }
+  int timeout_ms = (int)(timeout * 1000.0);
+
+  char *error = go_frankenphp_ensure_background_worker(
+      thread_index, (char *)ZSTR_VAL(name), ZSTR_LEN(name), timeout_ms);
+  if (error) {
+    zend_throw_exception(spl_ce_RuntimeException, error, 0);
+    free(error);
+    RETURN_THROWS();
+  }
+}
+
 PHP_FUNCTION(frankenphp_get_worker_handle) {
   ZEND_PARSE_PARAMETERS_NONE();
 
@@ -1417,9 +1477,32 @@ static void *php_thread(void *arg) {
       /* Background workers run indefinitely; disable max_execution_time
        * so PHP's default 30s timer doesn't interrupt their main loop.
        * php_request_startup re-arms the timer from INI, so we have to
-       * disarm it after the call. */
+       * disarm it after the call. Also surface the worker name in $_SERVER
+       * and $argv so catch-all workers can tell which instance they are. */
       if (is_background_worker) {
         zend_unset_timeout();
+        zend_is_auto_global_str("_SERVER", sizeof("_SERVER") - 1);
+        zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
+        if (server && Z_TYPE_P(server) == IS_ARRAY && worker_name != NULL) {
+          zval name_zval;
+          ZVAL_STRING(&name_zval, worker_name);
+          zend_hash_str_update(Z_ARRVAL_P(server), "FRANKENPHP_WORKER_NAME",
+                               sizeof("FRANKENPHP_WORKER_NAME") - 1,
+                               &name_zval);
+
+          zval argv_array;
+          array_init(&argv_array);
+          add_next_index_string(&argv_array, scriptName);
+          add_next_index_string(&argv_array, worker_name);
+
+          zval argc_zval;
+          ZVAL_LONG(&argc_zval, 2);
+
+          zend_hash_str_update(Z_ARRVAL_P(server), "argv", sizeof("argv") - 1,
+                               &argv_array);
+          zend_hash_str_update(Z_ARRVAL_P(server), "argc", sizeof("argc") - 1,
+                               &argc_zval);
+        }
       }
 
       zend_file_handle file_handle;
@@ -1443,6 +1526,10 @@ static void *php_thread(void *arg) {
                        zend_memory_usage(0), __ATOMIC_RELAXED);
 
       has_attempted_shutdown = true;
+
+      /* Capture the last PHP error before php_request_shutdown clears it,
+       * so background-worker boot failures can surface the cause. */
+      frankenphp_capture_last_php_error();
 
       /* shutdown the request, potential bailout to zend_catch */
       php_request_shutdown((void *)0);

@@ -35,6 +35,8 @@ type worker struct {
 	queuedRequests         atomic.Int32
 	isBackgroundWorker     bool
 	backgroundWorker       *backgroundWorkerState
+	backgroundRegistry     *backgroundWorkerRegistry
+	backgroundReserveOnce  sync.Once
 	backgroundStopFdWrite  atomic.Int32 // write end of the stop pipe, -1 if not set
 }
 
@@ -73,6 +75,10 @@ func initWorkers(opt []workerOpt) error {
 			workersByPath[w.fileName] = w
 		}
 	}
+
+	// Build the lookup (named + catch-all) and attach each bg worker to
+	// its registry so lazy-start siblings inherit the template options.
+	backgroundLookup = buildBackgroundWorkerLookup(workers, opt)
 
 	startupFailChan = make(chan error, totalThreadsToStart)
 
@@ -161,11 +167,9 @@ func newWorker(o workerOpt) (*worker, error) {
 	}
 
 	w.backgroundStopFdWrite.Store(-1)
-	if w.isBackgroundWorker {
-		w.backgroundWorker = &backgroundWorkerState{
-			ready: make(chan struct{}),
-		}
-	}
+	// backgroundWorker state is reserved lazily via the registry at
+	// thread-setup time, not here; lazy-start callers set it directly
+	// and eager inits go through setupScript's sync.Once.
 
 	w.configureMercure(&o)
 
