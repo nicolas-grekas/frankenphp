@@ -380,9 +380,10 @@ func isBootstrapEnsure(thread *phpThread) bool {
 	return ok && handler.isBootingScript
 }
 
-// go_frankenphp_ensure_background_worker declares a dependency on a
-// background worker by name. Lazy-starts it if not already running, then
-// blocks until it has called set_vars (ready state) or the timeout expires.
+// go_frankenphp_ensure_background_worker declares a dependency on one or
+// more background workers by name. Each named worker is lazy-started if
+// not already running; the call blocks until every one has reached ready
+// (set_vars called at least once) or the shared deadline expires.
 //
 // Bootstrap mode (HTTP worker before frankenphp_handle_request): fail-fast.
 // Any boot failure throws immediately with captured details, without
@@ -394,61 +395,78 @@ func isBootstrapEnsure(thread *phpThread) bool {
 // cycle recover from transient boot failures.
 //
 //export go_frankenphp_ensure_background_worker
-func go_frankenphp_ensure_background_worker(threadIndex C.uintptr_t, name *C.char, nameLen C.size_t, timeoutMs C.int) *C.char {
+func go_frankenphp_ensure_background_worker(threadIndex C.uintptr_t, names **C.char, nameLens *C.size_t, nameCount C.int, timeoutMs C.int) *C.char {
 	thread := phpThreads[threadIndex]
 	lookup := getLookup(thread)
 	if lookup == nil {
 		return C.CString("no background worker configured")
 	}
 
-	goName := C.GoStringN(name, C.int(nameLen))
+	n := int(nameCount)
+	nameSlice := unsafe.Slice(names, n)
+	nameLenSlice := unsafe.Slice(nameLens, n)
 	bootstrap := isBootstrapEnsure(thread)
-	if err := startBackgroundWorker(thread, goName); err != nil {
-		return C.CString(err.Error())
-	}
-	registry := lookup.Resolve(goName)
-	if registry == nil {
-		return C.CString("background worker not found: " + goName)
-	}
-	registry.mu.Lock()
-	sk := registry.workers[goName]
-	registry.mu.Unlock()
-	if sk == nil {
-		return C.CString("background worker not found: " + goName)
+
+	// Start each named worker first. Reserve their states so a shared
+	// deadline applies across the whole group (the caller gets one
+	// timeout value, not one per worker).
+	sks := make([]*backgroundWorkerState, n)
+	goNames := make([]string, n)
+	for i := 0; i < n; i++ {
+		goNames[i] = C.GoStringN(nameSlice[i], C.int(nameLenSlice[i]))
+		if err := startBackgroundWorker(thread, goNames[i]); err != nil {
+			return C.CString(err.Error())
+		}
+		registry := lookup.Resolve(goNames[i])
+		if registry == nil {
+			return C.CString("background worker not found: " + goNames[i])
+		}
+		registry.mu.Lock()
+		sks[i] = registry.workers[goNames[i]]
+		registry.mu.Unlock()
+		if sks[i] == nil {
+			return C.CString("background worker not found: " + goNames[i])
+		}
 	}
 
 	deadline := time.After(time.Duration(timeoutMs) * time.Millisecond)
 	if bootstrap {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-sk.ready:
-				return nil
-			case <-sk.aborted:
-				return C.CString(sk.abortErr)
-			case <-deadline:
-				return C.CString(formatBackgroundWorkerTimeoutError(goName, sk))
-			case <-globalCtx.Done():
-				return C.CString("frankenphp is shutting down")
-			case <-ticker.C:
-				if sk.bootFailure.Load() != nil {
-					return C.CString(formatBackgroundWorkerTimeoutError(goName, sk))
+		for i, sk := range sks {
+		wait:
+			for {
+				select {
+				case <-sk.ready:
+					break wait
+				case <-sk.aborted:
+					return C.CString(sk.abortErr)
+				case <-deadline:
+					return C.CString(formatBackgroundWorkerTimeoutError(goNames[i], sk))
+				case <-globalCtx.Done():
+					return C.CString("frankenphp is shutting down")
+				case <-ticker.C:
+					if sk.bootFailure.Load() != nil {
+						return C.CString(formatBackgroundWorkerTimeoutError(goNames[i], sk))
+					}
 				}
 			}
 		}
+		return nil
 	}
 
-	select {
-	case <-sk.ready:
-		return nil
-	case <-sk.aborted:
-		return C.CString(sk.abortErr)
-	case <-deadline:
-		return C.CString(formatBackgroundWorkerTimeoutError(goName, sk))
-	case <-globalCtx.Done():
-		return C.CString("frankenphp is shutting down")
+	for i, sk := range sks {
+		select {
+		case <-sk.ready:
+		case <-sk.aborted:
+			return C.CString(sk.abortErr)
+		case <-deadline:
+			return C.CString(formatBackgroundWorkerTimeoutError(goNames[i], sk))
+		case <-globalCtx.Done():
+			return C.CString("frankenphp is shutting down")
+		}
 	}
+	return nil
 }
 
 func formatBackgroundWorkerTimeoutError(name string, sk *backgroundWorkerState) string {

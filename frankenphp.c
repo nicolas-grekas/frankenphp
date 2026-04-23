@@ -993,8 +993,8 @@ PHP_FUNCTION(frankenphp_get_vars) {
   Z_PARAM_STR(name);
   ZEND_PARSE_PARAMETERS_END();
 
-  char *error = go_frankenphp_get_vars((char *)ZSTR_VAL(name), ZSTR_LEN(name),
-                                       return_value);
+  char *error = go_frankenphp_get_vars(thread_index, (char *)ZSTR_VAL(name),
+                                       ZSTR_LEN(name), return_value);
   if (error) {
     zend_throw_exception(spl_ce_RuntimeException, error, 0);
     free(error);
@@ -1003,11 +1003,11 @@ PHP_FUNCTION(frankenphp_get_vars) {
 }
 
 PHP_FUNCTION(frankenphp_ensure_background_worker) {
-  zend_string *name = NULL;
+  zval *names_zv;
   double timeout = 30.0;
 
   ZEND_PARSE_PARAMETERS_START(1, 2);
-  Z_PARAM_STR(name);
+  Z_PARAM_ZVAL(names_zv);
   Z_PARAM_OPTIONAL;
   Z_PARAM_DOUBLE(timeout);
   ZEND_PARSE_PARAMETERS_END();
@@ -1019,8 +1019,59 @@ PHP_FUNCTION(frankenphp_ensure_background_worker) {
   }
   int timeout_ms = (int)(timeout * 1000.0);
 
+  /* Accept either a single string or an array of strings. For a single
+   * string we avoid the allocation by pointing at ZSTR fields directly. */
+  char **name_ptrs = NULL;
+  size_t *name_lens = NULL;
+  int name_count = 0;
+  char *single_name_ptr = NULL;
+  size_t single_name_len = 0;
+
+  if (Z_TYPE_P(names_zv) == IS_STRING) {
+    single_name_ptr = Z_STRVAL_P(names_zv);
+    single_name_len = Z_STRLEN_P(names_zv);
+    name_ptrs = &single_name_ptr;
+    name_lens = &single_name_len;
+    name_count = 1;
+  } else if (Z_TYPE_P(names_zv) == IS_ARRAY) {
+    HashTable *ht = Z_ARRVAL_P(names_zv);
+    name_count = zend_hash_num_elements(ht);
+    if (name_count == 0) {
+      zend_value_error("frankenphp_ensure_background_worker(): names array "
+                       "must not be empty");
+      RETURN_THROWS();
+    }
+    name_ptrs = emalloc(name_count * sizeof(*name_ptrs));
+    name_lens = emalloc(name_count * sizeof(*name_lens));
+    int idx = 0;
+    zval *v;
+    ZEND_HASH_FOREACH_VAL(ht, v) {
+      if (Z_TYPE_P(v) != IS_STRING) {
+        efree(name_ptrs);
+        efree(name_lens);
+        zend_type_error("frankenphp_ensure_background_worker(): names array "
+                        "must contain only strings");
+        RETURN_THROWS();
+      }
+      name_ptrs[idx] = Z_STRVAL_P(v);
+      name_lens[idx] = Z_STRLEN_P(v);
+      idx++;
+    }
+    ZEND_HASH_FOREACH_END();
+  } else {
+    zend_type_error("frankenphp_ensure_background_worker(): name must be a "
+                    "string or an array of strings");
+    RETURN_THROWS();
+  }
+
   char *error = go_frankenphp_ensure_background_worker(
-      thread_index, (char *)ZSTR_VAL(name), ZSTR_LEN(name), timeout_ms);
+      thread_index, name_ptrs, name_lens, name_count, timeout_ms);
+
+  if (name_count > 1) {
+    efree(name_ptrs);
+    efree(name_lens);
+  }
+
   if (error) {
     zend_throw_exception(spl_ce_RuntimeException, error, 0);
     free(error);
@@ -1483,25 +1534,33 @@ static void *php_thread(void *arg) {
         zend_unset_timeout();
         zend_is_auto_global_str("_SERVER", sizeof("_SERVER") - 1);
         zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
-        if (server && Z_TYPE_P(server) == IS_ARRAY && worker_name != NULL) {
-          zval name_zval;
-          ZVAL_STRING(&name_zval, worker_name);
-          zend_hash_str_update(Z_ARRVAL_P(server), "FRANKENPHP_WORKER_NAME",
-                               sizeof("FRANKENPHP_WORKER_NAME") - 1,
-                               &name_zval);
+        if (server && Z_TYPE_P(server) == IS_ARRAY) {
+          zval bg_zval;
+          ZVAL_TRUE(&bg_zval);
+          zend_hash_str_update(
+              Z_ARRVAL_P(server), "FRANKENPHP_WORKER_BACKGROUND",
+              sizeof("FRANKENPHP_WORKER_BACKGROUND") - 1, &bg_zval);
 
-          zval argv_array;
-          array_init(&argv_array);
-          add_next_index_string(&argv_array, scriptName);
-          add_next_index_string(&argv_array, worker_name);
+          if (worker_name != NULL) {
+            zval name_zval;
+            ZVAL_STRING(&name_zval, worker_name);
+            zend_hash_str_update(Z_ARRVAL_P(server), "FRANKENPHP_WORKER_NAME",
+                                 sizeof("FRANKENPHP_WORKER_NAME") - 1,
+                                 &name_zval);
 
-          zval argc_zval;
-          ZVAL_LONG(&argc_zval, 2);
+            zval argv_array;
+            array_init(&argv_array);
+            add_next_index_string(&argv_array, scriptName);
+            add_next_index_string(&argv_array, worker_name);
 
-          zend_hash_str_update(Z_ARRVAL_P(server), "argv", sizeof("argv") - 1,
-                               &argv_array);
-          zend_hash_str_update(Z_ARRVAL_P(server), "argc", sizeof("argc") - 1,
-                               &argc_zval);
+            zval argc_zval;
+            ZVAL_LONG(&argc_zval, 2);
+
+            zend_hash_str_update(Z_ARRVAL_P(server), "argv", sizeof("argv") - 1,
+                                 &argv_array);
+            zend_hash_str_update(Z_ARRVAL_P(server), "argc", sizeof("argc") - 1,
+                                 &argc_zval);
+          }
         }
       }
 
