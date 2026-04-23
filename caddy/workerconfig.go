@@ -41,6 +41,13 @@ type workerConfig struct {
 	MatchPath []string `json:"match_path,omitempty"`
 	// MaxConsecutiveFailures sets the maximum number of consecutive failures before panicking (defaults to 6, set to -1 to never panick)
 	MaxConsecutiveFailures int `json:"max_consecutive_failures,omitempty"`
+	// Background marks this worker as a background (non-HTTP) worker.
+	// No `omitempty`: Caddy can reuse module instances across config reloads,
+	// and json.Unmarshal only overwrites fields present in the JSON. With
+	// `omitempty` on a bool, a previous true value would persist into a new
+	// config that doesn't specify the field, silently turning an HTTP worker
+	// into a background worker.
+	Background bool `json:"background"`
 
 	options        []frankenphp.WorkerOption
 	requestOptions []frankenphp.RequestOption
@@ -145,13 +152,30 @@ func unmarshalWorker(d *caddyfile.Dispenser) (workerConfig, error) {
 			}
 
 			wc.MaxConsecutiveFailures = v
+		case "background":
+			wc.Background = true
 		default:
-			return wc, wrongSubDirectiveError("worker", "name, file, num, env, watch, match, max_consecutive_failures, max_threads", v)
+			return wc, wrongSubDirectiveError("worker", "name, file, num, env, watch, match, max_consecutive_failures, max_threads, background", v)
 		}
 	}
 
 	if wc.FileName == "" {
 		return wc, d.Err(`the "file" argument must be specified`)
+	}
+
+	if wc.Background {
+		if wc.Name == "" {
+			return wc, d.Err(`background workers must have an explicit "name"`)
+		}
+		if wc.Num > 1 {
+			return wc, d.Err(`"num" > 1 is not yet supported for background workers`)
+		}
+		if wc.MaxThreads > 1 {
+			return wc, d.Err(`"max_threads" > 1 is not yet supported for background workers`)
+		}
+		if len(wc.MatchPath) != 0 {
+			return wc, d.Err(`"match" is not supported for background workers`)
+		}
 	}
 
 	if frankenphp.EmbeddedAppPath != "" && filepath.IsLocal(wc.FileName) {

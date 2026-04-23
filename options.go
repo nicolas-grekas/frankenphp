@@ -50,6 +50,7 @@ type workerOpt struct {
 	onThreadShutdown       func(int)
 	onServerStartup        func()
 	onServerShutdown       func()
+	isBackgroundWorker     bool
 }
 
 // WithContext sets the main context to use.
@@ -253,6 +254,18 @@ func WithWorkerOnServerStartup(f func()) WorkerOption {
 func WithWorkerOnServerShutdown(f func()) WorkerOption {
 	return func(w *workerOpt) error {
 		w.onServerShutdown = f
+
+		return nil
+	}
+}
+
+// EXPERIMENTAL: WithWorkerBackground marks this worker as a background
+// (non-HTTP) worker. Background workers run outside the request cycle and
+// publish shared variables via frankenphp_set_vars for HTTP threads to read
+// via frankenphp_get_vars.
+func WithWorkerBackground() WorkerOption {
+	return func(w *workerOpt) error {
+		w.isBackgroundWorker = true
 
 		return nil
 	}

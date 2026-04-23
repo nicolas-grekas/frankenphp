@@ -54,3 +54,23 @@ function mercure_publish(string|array $topics, string $data = '', bool $private 
  * array<string, any> $context Values of the array will be converted to the corresponding Go type (if supported by FrankenPHP) and added to the context of the structured logs using https://pkg.go.dev/log/slog#Attr
  */
 function frankenphp_log(string $message, int $level = 0, array $context = []): void {}
+
+/**
+ * Publish the given vars from a background worker. Only callable from a
+ * worker started with the `background` flag. Values must be null, scalars,
+ * arrays of allowed values, or enum cases.
+ */
+function frankenphp_set_vars(array $vars): void {}
+
+/**
+ * Read the shared vars published by the named background worker. Throws if
+ * the worker is not declared, not running, or has not yet called set_vars.
+ */
+function frankenphp_get_vars(string $name): array {}
+
+/**
+ * Return the stop-signal stream for the current background worker. The
+ * stream closes when FrankenPHP is draining the worker so the script can
+ * exit its loop gracefully. Only callable from inside a background worker.
+ */
+function frankenphp_get_worker_handle() {}

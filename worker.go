@@ -33,6 +33,9 @@ type worker struct {
 	onThreadReady          func(int)
 	onThreadShutdown       func(int)
 	queuedRequests         atomic.Int32
+	isBackgroundWorker     bool
+	backgroundWorker       *backgroundWorkerState
+	backgroundStopFdWrite  atomic.Int32 // write end of the stop pipe, -1 if not set
 }
 
 var (
@@ -76,7 +79,11 @@ func initWorkers(opt []workerOpt) error {
 	for _, w := range workers {
 		for i := 0; i < w.num; i++ {
 			thread := getInactivePHPThread()
-			convertToWorkerThread(thread, w)
+			if w.isBackgroundWorker {
+				convertToBackgroundWorkerThread(thread, w)
+			} else {
+				convertToWorkerThread(thread, w)
+			}
 
 			workersReady.Go(func() {
 				thread.state.WaitFor(state.Ready, state.ShuttingDown, state.Done)
@@ -121,8 +128,10 @@ func newWorker(o workerOpt) (*worker, error) {
 	}
 
 	// workers that have a name starting with "m#" are module workers
-	// they can only be matched by their name, not by their path
-	allowPathMatching := !strings.HasPrefix(o.name, "m#")
+	// they can only be matched by their name, not by their path.
+	// Background workers are matched only by name, never by path, since
+	// they don't handle HTTP requests.
+	allowPathMatching := !strings.HasPrefix(o.name, "m#") && !o.isBackgroundWorker
 
 	if w := workersByPath[absFileName]; w != nil && allowPathMatching {
 		return w, fmt.Errorf("two workers cannot have the same filename: %q", absFileName)
@@ -148,6 +157,14 @@ func newWorker(o workerOpt) (*worker, error) {
 		maxConsecutiveFailures: o.maxConsecutiveFailures,
 		onThreadReady:          o.onThreadReady,
 		onThreadShutdown:       o.onThreadShutdown,
+		isBackgroundWorker:     o.isBackgroundWorker,
+	}
+
+	w.backgroundStopFdWrite.Store(-1)
+	if w.isBackgroundWorker {
+		w.backgroundWorker = &backgroundWorkerState{
+			ready: make(chan struct{}),
+		}
 	}
 
 	w.configureMercure(&o)

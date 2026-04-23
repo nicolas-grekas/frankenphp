@@ -167,6 +167,10 @@ func (f *FrankenPHPApp) Start() error {
 			frankenphp.WithWorkerRequestOptions(w.requestOptions...),
 		)
 
+		if w.Background {
+			w.options = append(w.options, frankenphp.WithWorkerBackground())
+		}
+
 		f.opts = append(f.opts, frankenphp.WithWorkers(w.Name, repl.ReplaceKnown(w.FileName, ""), w.Num, w.options...))
 	}
 

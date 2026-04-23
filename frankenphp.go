@@ -160,8 +160,15 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 
 	for i, w := range opt.workers {
 		if w.num <= 0 {
-			// https://github.com/php/frankenphp/issues/126
-			opt.workers[i].num = maxProcs
+			if w.isBackgroundWorker {
+				// Background workers default to a single thread; they're
+				// declared explicitly per worker and don't benefit from the
+				// HTTP-worker default of scaling to 2 * GOMAXPROCS.
+				opt.workers[i].num = 1
+			} else {
+				// https://github.com/php/frankenphp/issues/126
+				opt.workers[i].num = maxProcs
+			}
 		}
 		metrics.TotalWorkers(w.name, w.num)
 
