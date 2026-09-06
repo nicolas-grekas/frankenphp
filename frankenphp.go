@@ -156,16 +156,41 @@ func Config() PHPConfig {
 	}
 }
 
-func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
+func calculateMaxThreads(opt *opt) (numWorkers int, err error) {
 	maxProcs := runtime.GOMAXPROCS(0) * 2
 	maxThreadsFromWorkers := 0
 
+	// background workers reserve their thread budget separately so they
+	// don't count against the HTTP-oriented admission checks below; the
+	// bump is applied on top of the calculated totals at the end
+	reservedThreads := 0
+	defer func() {
+		if err != nil {
+			return
+		}
+		opt.numThreads += reservedThreads
+		if opt.maxThreads > 0 {
+			// in auto mode (maxThreads < 0), the resolved value is floored
+			// to numThreads later, which already includes the reservation
+			opt.maxThreads += reservedThreads
+		}
+		numWorkers += reservedThreads
+	}()
+
 	for i, w := range opt.workers {
+		if w.isBackgroundWorker {
+			if w.num < 1 {
+				return 0, fmt.Errorf("background worker %q must declare num >= 1", w.name)
+			}
+			reservedThreads += w.num
+
+			continue
+		}
+
 		if w.num <= 0 {
 			// https://github.com/php/frankenphp/issues/126
 			opt.workers[i].num = maxProcs
 		}
-		metrics.TotalWorkers(w.name, w.num)
 
 		numWorkers += opt.workers[i].num
 
@@ -467,7 +492,7 @@ func go_apache_request_headers(threadIndex C.uintptr_t) (*C.go_string, C.size_t)
 		// worker mode, not handling a request
 
 		if fc.logger.Enabled(fc.ctx, slog.LevelDebug) {
-			fc.logger.LogAttrs(fc.ctx, slog.LevelDebug, "apache_request_headers() called in non-HTTP context", slog.String("worker", fc.worker.name))
+			fc.logger.LogAttrs(fc.ctx, slog.LevelDebug, "apache_request_headers() called in non-HTTP context", slog.String("worker", fc.worker.qualifiedName))
 		}
 
 		return nil, 0
@@ -807,7 +832,7 @@ func resetGlobals() {
 	globalCtx = context.Background()
 	globalLogger = slog.Default()
 	workers = nil
-	workersByName = nil
+	globalWorkersByName = nil
 	globalWorkersByPath = nil
 	servers = nil
 	watcherIsEnabled = false

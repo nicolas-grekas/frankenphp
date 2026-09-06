@@ -1,7 +1,6 @@
 package caddy
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -249,38 +248,73 @@ func TestModuleWorkerWithCustomName(t *testing.T) {
 	require.Equal(t, "../testdata/worker-with-env.php", module.Workers[0].FileName, "Worker should have the correct filename")
 }
 
-func TestCreateUniqueWorkerNames(t *testing.T) {
-	app := &FrankenPHPApp{}
-	filename := "../testdata/worker-with-env.php"
-	absFileName, _ := filepath.Abs(filename)
-	names := make([]string, 6)
-	for i := range 3 {
-		names[i] = app.createUniqueWorkerName(workerConfig{
-			FileName: filename,
-			Name:     "custom-worker-name",
-		}, "")
-		names[i+3] = app.createUniqueWorkerName(workerConfig{
-			FileName: filename,
-		}, "")
-	}
+func TestWorkerBackgroundConfig(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+	{
+		php_server {
+			worker {
+				name jobs
+				file ../testdata/worker-with-env.php
+				num 2
+				background
+			}
+		}
+	}`)
+	module := &FrankenPHPModule{}
 
-	require.Equal(t, "custom-worker-name", names[0])
-	require.Equal(t, "custom-worker-name_1", names[1])
-	require.Equal(t, "custom-worker-name_2", names[2])
-	require.Equal(t, absFileName, names[3])
-	require.Equal(t, absFileName+"_1", names[4])
-	require.Equal(t, absFileName+"_2", names[5])
+	require.NoError(t, module.UnmarshalCaddyfile(d))
+	require.Len(t, module.Workers, 1)
+	require.True(t, module.Workers[0].Background)
+	require.Equal(t, "jobs", module.Workers[0].Name)
 }
 
-func TestCreateUniqueWorkerNamesQualifiedByServer(t *testing.T) {
-	app := &FrankenPHPApp{}
-	wc := workerConfig{FileName: "../testdata/worker-with-env.php", Name: "queue"}
+func TestWorkerBackgroundRequiresName(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+	{
+		php_server {
+			worker {
+				file ../testdata/worker-with-env.php
+				background
+			}
+		}
+	}`)
+	module := &FrankenPHPModule{}
 
-	require.Equal(t, "queue", app.createUniqueWorkerName(wc, "one.example.com"))
-	// on collision, the name is qualified with the server name
-	require.Equal(t, "two.example.com:queue", app.createUniqueWorkerName(wc, "two.example.com"))
-	// when the qualified name is also taken, fall back to the numeric postfix
-	require.Equal(t, "queue_1", app.createUniqueWorkerName(wc, "two.example.com"))
-	// workers without a server keep the numeric postfix behavior
-	require.Equal(t, "queue_2", app.createUniqueWorkerName(wc, ""))
+	err := module.UnmarshalCaddyfile(d)
+	require.ErrorContains(t, err, `background workers must have an explicit "name"`)
+}
+
+func TestWorkerBackgroundRequiresNum(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+	{
+		php_server {
+			worker {
+				name jobs
+				file ../testdata/worker-with-env.php
+				background
+			}
+		}
+	}`)
+	module := &FrankenPHPModule{}
+
+	err := module.UnmarshalCaddyfile(d)
+	require.ErrorContains(t, err, `background workers must declare "num" >= 1`)
+}
+
+func TestWorkerBackgroundRejectsMatch(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+	{
+		php_server {
+			worker {
+				name jobs
+				file ../testdata/worker-with-env.php
+				match /jobs/*
+				background
+			}
+		}
+	}`)
+	module := &FrankenPHPModule{}
+
+	err := module.UnmarshalCaddyfile(d)
+	require.ErrorContains(t, err, `"match" is not supported for background workers`)
 }

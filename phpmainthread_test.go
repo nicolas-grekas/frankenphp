@@ -252,28 +252,26 @@ func TestFinishBootingAWorkerScript(t *testing.T) {
 
 func TestReturnAnErrorIf2WorkersHaveTheSameFileName(t *testing.T) {
 	resetGlobals()
-	workers = []*worker{}
-	workersByName = map[string]*worker{}
+	globalWorkersByName = map[string]*worker{}
 	globalWorkersByPath = map[string]*worker{}
-	w, err1 := newWorker(workerOpt{fileName: testDataPath + "/index.php"})
-	assert.NoError(t, err1)
-	workers = append(workers, w)
-	workersByName[w.name] = w
-	globalWorkersByPath[w.fileName] = w
-	_, err2 := newWorker(workerOpt{fileName: testDataPath + "/index.php"})
-	assert.Error(t, err2, "two workers cannot have the same filename")
+	w1, err := newWorker(workerOpt{fileName: testDataPath + "/index.php"})
+	assert.NoError(t, err)
+	assert.NoError(t, addGlobalWorker(w1))
+	w2, err := newWorker(workerOpt{fileName: testDataPath + "/index.php", name: "other"})
+	assert.NoError(t, err)
+	assert.ErrorContains(t, addGlobalWorker(w2), "two global workers cannot have the same filename")
 }
 
 func TestReturnAnErrorIf2ModuleWorkersHaveTheSameName(t *testing.T) {
 	resetGlobals()
-	workers = []*worker{}
-	workersByName = map[string]*worker{}
-	w, err1 := newWorker(workerOpt{fileName: testDataPath + "/index.php", name: "workername"})
-	assert.NoError(t, err1)
-	workers = append(workers, w)
-	workersByName[w.name] = w
-	_, err2 := newWorker(workerOpt{fileName: testDataPath + "/hello.php", name: "workername"})
-	assert.Error(t, err2, "two workers cannot have the same name")
+	globalWorkersByName = map[string]*worker{}
+	globalWorkersByPath = map[string]*worker{}
+	w1, err := newWorker(workerOpt{fileName: testDataPath + "/index.php", name: "workername"})
+	assert.NoError(t, err)
+	assert.NoError(t, addGlobalWorker(w1))
+	w2, err := newWorker(workerOpt{fileName: testDataPath + "/hello.php", name: "workername"})
+	assert.NoError(t, err)
+	assert.ErrorContains(t, addGlobalWorker(w2), "two global workers cannot have the same name")
 }
 
 func getDummyWorker(t *testing.T, fileName string) *worker {

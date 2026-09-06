@@ -17,7 +17,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/dunglas/frankenphp"
-	"github.com/dunglas/frankenphp/internal/fastabs"
 )
 
 var (
@@ -60,15 +59,14 @@ type FrankenPHPApp struct {
 	// EXPERIMENTAL: MaxRequests sets the maximum number of requests a PHP thread handles before restarting (0 = unlimited)
 	MaxRequests int `json:"max_requests,omitempty"`
 
-	opts            []frankenphp.Option
-	metrics         frankenphp.Metrics
-	ctx             context.Context
-	logger          *slog.Logger
-	modules         []*FrankenPHPModule
-	usedWorkerNames map[string]bool
-	httpApp         *caddyhttp.App
-	hasStarted      atomic.Bool
-	started         chan any
+	opts       []frankenphp.Option
+	metrics    frankenphp.Metrics
+	ctx        context.Context
+	logger     *slog.Logger
+	modules    []*FrankenPHPModule
+	httpApp    *caddyhttp.App
+	hasStarted atomic.Bool
+	started    chan any
 }
 
 var errIni = errors.New(`"php_ini" must be in the format: php_ini "<key>" "<value>"`)
@@ -133,7 +131,6 @@ func (f *FrankenPHPApp) Start() error {
 	// register global workers
 	for _, w := range f.Workers {
 		w.FileName = repl.ReplaceKnown(w.FileName, "")
-		w.Name = f.createUniqueWorkerName(w, "")
 		opts, err := w.toWorkerOptions()
 		if err != nil {
 			return err
@@ -224,7 +221,6 @@ func (f *FrankenPHPApp) registerModule(repl *caddy.Replacer, module *FrankenPHPM
 
 	for _, w := range module.Workers {
 		w.FileName = repl.ReplaceKnown(w.FileName, "")
-		w.Name = f.createUniqueWorkerName(w, serverName)
 		workerOptions, err := w.toWorkerOptions()
 		if err != nil {
 			return err
@@ -234,37 +230,6 @@ func (f *FrankenPHPApp) registerModule(repl *caddy.Replacer, module *FrankenPHPM
 	}
 
 	return nil
-}
-
-// avoid name collisions for workers
-// on collision, a name is first qualified with the server name
-// ("<serverName>:<name>") before falling back to a numeric postfix
-func (f *FrankenPHPApp) createUniqueWorkerName(wc workerConfig, serverName string) string {
-	if f.usedWorkerNames == nil {
-		f.usedWorkerNames = make(map[string]bool)
-	}
-
-	if wc.Name == "" {
-		wc.Name, _ = fastabs.FastAbs(wc.FileName)
-	}
-
-	name := wc.Name
-	suffix := 0
-	for {
-		if _, ok := f.usedWorkerNames[name]; !ok {
-			f.usedWorkerNames[name] = true
-			break
-		}
-		if serverName != "" {
-			name = serverName + ":" + wc.Name
-			serverName = ""
-			continue
-		}
-		suffix++
-		name = fmt.Sprintf("%s_%d", wc.Name, suffix)
-	}
-
-	return name
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.

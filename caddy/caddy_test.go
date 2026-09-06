@@ -839,7 +839,7 @@ func TestWorkerMetrics(t *testing.T) {
 	# TYPE frankenphp_worker_request_count counter
 	frankenphp_worker_request_count{worker="` + workerName + `"} 10
 
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="` + workerName + `"} 2
 	`
@@ -996,7 +996,7 @@ func TestNamedWorkerMetrics(t *testing.T) {
 	# TYPE frankenphp_worker_request_count counter
 	frankenphp_worker_request_count{worker="my_app"} 10
 
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="my_app"} 2
 	`
@@ -1092,7 +1092,7 @@ func TestAutoWorkerConfig(t *testing.T) {
 	# TYPE frankenphp_worker_request_count counter
 	frankenphp_worker_request_count{worker="` + workerName + `"} 10
 
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="` + workerName + `"} ` + workers + `
 	`
@@ -1460,7 +1460,7 @@ func TestMultiWorkersMetrics(t *testing.T) {
 	# TYPE frankenphp_worker_request_count counter
 	frankenphp_worker_request_count{worker="service1"} 10
 
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="service1"} 2
 	frankenphp_ready_workers{worker="service2"} 3
@@ -1614,7 +1614,7 @@ func TestWorkerRestart(t *testing.T) {
 
 	// Check metrics
 	expectedMetrics := `
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="service"} 1
 	# HELP frankenphp_total_workers Total number of PHP workers for this worker
@@ -1642,7 +1642,7 @@ func TestWorkerRestart(t *testing.T) {
 
 	// frankenphp_ready_workers should be back to 1 even after worker restarts
 	expectedMetrics = `
-	# HELP frankenphp_ready_workers Running workers that have successfully called frankenphp_handle_request at least once
+	# HELP frankenphp_ready_workers Running workers that have reached their ready point at least once: frankenphp_handle_request for HTTP workers, frankenphp_get_worker_handle for background workers
 	# TYPE frankenphp_ready_workers gauge
 	frankenphp_ready_workers{worker="service"} 1
 	# HELP frankenphp_total_workers Total number of PHP workers for this worker

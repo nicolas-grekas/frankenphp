@@ -20,7 +20,7 @@ type Server struct {
 	root                      string
 	splitPath                 []string
 	env                       PreparedEnv
-	workers                   []*worker
+	workersByName             map[string]*worker
 	workersByPath             map[string]*worker
 	workersWithRequestMatcher []*worker
 
@@ -37,11 +37,11 @@ var (
 
 func newFallbackServer() *Server {
 	s := &Server{
-		idx:           -1,
-		workersByPath: make(map[string]*worker),
-		env:           make(map[string]string),
-		logger:        globalLogger,
+		idx:    -1,
+		env:    make(map[string]string),
+		logger: globalLogger,
 	}
+	s.resetWorkers()
 
 	return s
 }
@@ -54,12 +54,25 @@ func registerServers(newServers []*Server) {
 	fallbackServer.logger = globalLogger
 	fallbackServer.resetWorkers()
 
+	names := make(map[string]struct{}, len(servers))
 	for i, s := range servers {
 		s.idx = i
-		s.name = s.configuredName
-		if s.name == "" {
-			s.name = "server_" + strconv.Itoa(i)
+		name := s.configuredName
+		if name == "" {
+			name = "server_" + strconv.Itoa(i)
 		}
+
+		// several servers may resolve to the same name (e.g. the same host), but
+		// the name qualifies worker names in metrics and logs, so it must be unique
+		for base, n := name, 1; ; n++ {
+			if _, taken := names[name]; !taken {
+				break
+			}
+			name = base + "_" + strconv.Itoa(n)
+		}
+		names[name] = struct{}{}
+
+		s.name = name
 		s.resetWorkers()
 	}
 }
@@ -83,7 +96,7 @@ func unregisterServers() {
 
 // resetWorkers drops the workers of a previous run; initWorkers() adds them back
 func (s *Server) resetWorkers() {
-	s.workers = nil
+	s.workersByName = make(map[string]*worker)
 	s.workersByPath = make(map[string]*worker)
 	s.workersWithRequestMatcher = nil
 }
@@ -99,9 +112,9 @@ func NewServer(root string, options ...ServerOption) (*Server, error) {
 	}
 
 	s := &Server{
-		root:          root,
-		workersByPath: make(map[string]*worker),
+		root: root,
 	}
+	s.resetWorkers()
 
 	for _, option := range options {
 		if err := option(s); err != nil {
@@ -125,19 +138,30 @@ func NewServer(root string, options ...ServerOption) (*Server, error) {
 }
 
 // Name returns the human-readable name of the server.
-// It is empty until registration if none was passed to NewServer().
+// It is empty until registration if none was passed to NewServer(), and gets
+// a numeric suffix if another registered server has the same name.
 func (s *Server) Name() string {
 	return s.name
 }
 
+// addWorker registers a worker scoped to this server
 func (s *Server) addWorker(w *worker) error {
-	s.workers = append(s.workers, w)
+	if s.workersByName[w.name] != nil {
+		return fmt.Errorf("two workers in a server cannot have the same name: %q", w.name)
+	}
+	s.workersByName[w.name] = w
+
+	// background workers never serve requests, so they are not matched at all
+	if w.isBackgroundWorker {
+		return nil
+	}
+
 	if w.matchRequest != nil {
 		s.workersWithRequestMatcher = append(s.workersWithRequestMatcher, w)
 		return nil
 	}
 
-	if _, exists := s.workersByPath[w.fileName]; exists {
+	if s.workersByPath[w.fileName] != nil {
 		return fmt.Errorf("two workers in a server cannot have the same filename: %q", w.fileName)
 	}
 	s.workersByPath[w.fileName] = w
