@@ -237,6 +237,22 @@ while (true) {
 
 `$_SERVER['FRANKENPHP_WORKER']` holds the declared name, as it does in HTTP workers, and `$_SERVER['FRANKENPHP_WORKER_BACKGROUND']` is set, so a script serving both roles can tell them apart with `isset()`. Background threads come on top of `num_threads` and `max_threads`; they don't autoscale, so `max_threads` is not allowed on them. From Go, declare one with `WithWorkerBackground()`.
 
+### Sharing state with background workers
+
+A background worker publishes a snapshot with `frankenphp_set_vars()`; requests and other workers read it with `frankenphp_get_vars()`, by worker name, resolved like requests are: within the `php_server`, then among global workers. Values must be null, scalars, arrays or enums. Each call replaces the whole snapshot and readers get a copy, so the worker can publish at any time and a request always sees a consistent one. Publish before the first wait on the handle and the snapshot is in place before the server accepts requests; while the worker restarts, readers keep getting the last one.
+
+```php
+// background worker
+frankenphp_set_vars(['maintenance' => false, 'flags' => ['beta' => true]]);
+$handle = frankenphp_get_worker_handle();
+// ...
+
+// request, HTTP worker or another background worker
+$vars = frankenphp_get_vars('config');
+```
+
+`frankenphp_get_vars()` blocks until the worker reached its ready point, which can only happen between background workers reading each other while booting; a cycle between them throws instead of hanging. It also throws when the name is unknown, or when the worker is ready but has not published anything.
+
 ## Superglobals behavior
 
 [PHP superglobals](https://www.php.net/manual/language.variables.superglobals.php) (`$_SERVER`, `$_ENV`, `$_GET`...)
