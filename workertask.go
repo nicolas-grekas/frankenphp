@@ -530,8 +530,11 @@ func go_frankenphp_task_receiver_close(handle C.uintptr_t, aborted C.bool) {
 	settled := !t.senderGone
 	t.cond.Broadcast()
 	t.mu.Unlock()
-	// the sender finds the end of the task behind the updates still queued
-	t.signalSender()
+	// the sender finds the end of the task behind the updates still queued;
+	// nobody waits on its descriptor once it closed
+	if settled {
+		t.signalSender()
+	}
 
 	name := t.worker.qualifiedName
 	metrics.StopWorkerTask(name, time.Since(t.pickedUpAt))
@@ -563,10 +566,11 @@ func go_frankenphp_task_sender_close(handle C.uintptr_t) {
 	t.updates = nil
 	t.cond.Broadcast()
 	t.mu.Unlock()
-	// the receiver's stream_select() and feof() see it
-	t.signalReceiver()
 
 	if settled {
+		// the receiver's stream_select() and feof() see it; once the
+		// receiver closed, nobody waits on its descriptor
+		t.signalReceiver()
 		metrics.WorkerTaskOutcome(t.worker.qualifiedName, TaskOutcomeAbandoned)
 	}
 	for _, update := range updates {
