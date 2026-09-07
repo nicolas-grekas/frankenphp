@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/dunglas/frankenphp/internal/fastabs"
 	"github.com/dunglas/frankenphp/internal/state"
@@ -50,6 +51,12 @@ type worker struct {
 	// tasks holds the tasks sent with frankenphp_send_task() until a thread
 	// picks them up
 	tasks taskQueue
+	// taskWords is C memory shared with the scripts' threads for the park
+	// handshake without a callback: [0] counts the pending tasks, [1+i] is
+	// the parked flag of the worker's i-th thread, see
+	// frankenphp_worker_handle_read; nil for HTTP workers
+	taskWords *C.int32_t
+	taskSlots atomic.Int32
 }
 
 // markReady records that the background worker reached its ready point once
@@ -225,6 +232,10 @@ func newWorker(o workerOpt) (*worker, error) {
 	}
 
 	w.configureMercure(&o)
+
+	if o.isBackgroundWorker {
+		w.taskWords = (*C.int32_t)(C.calloc(C.size_t(o.num+1), C.size_t(unsafe.Sizeof(C.int32_t(0)))))
+	}
 
 	w.requestOptions = append(
 		w.requestOptions,

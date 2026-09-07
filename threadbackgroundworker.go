@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/dunglas/frankenphp/internal/state"
 )
@@ -52,10 +53,13 @@ type backgroundWorkerThread struct {
 	// frankenphp_send_task() writes its wake-up line to it.
 	stopSock int64
 
-	// parked is set while the script blocks reading its handle, or cast it
-	// for a select, and no task is queued: senders wake one parked thread
-	// per task. Guarded by worker.tasks.mu.
-	parked bool
+	// parkedWord is the thread's slot in worker.taskWords: 1 while the
+	// script blocks reading its handle, or cast it for a select, and no task
+	// is queued. The script's thread sets it in C, senders claim it with a
+	// compare-and-swap, so a claim goes to exactly one sender and a thread
+	// never parks unaware of a task queued meanwhile, see
+	// frankenphp_worker_handle_read.
+	parkedWord *C.int32_t
 
 	// signaling counts the senders writing to stopSock outside of
 	// worker.tasks.mu, so the socket is only closed once they are done: the
@@ -77,8 +81,22 @@ func convertToBackgroundWorkerThread(thread *phpThread, worker *worker) {
 		worker:   worker,
 		stopSock: -1,
 	}
+	slot := worker.taskSlots.Add(1)
+	handler.parkedWord = (*C.int32_t)(unsafe.Add(unsafe.Pointer(worker.taskWords), uintptr(slot)*unsafe.Sizeof(C.int32_t(0))))
 	thread.setHandler(handler)
 	worker.attachThread(thread)
+}
+
+// setParked writes the thread's parked flag; senders claim it with
+// claimParked
+func (handler *backgroundWorkerThread) setParked(v int32) {
+	atomic.StoreInt32((*int32)(unsafe.Pointer(handler.parkedWord)), v)
+}
+
+// claimParked takes the thread's parked flag, once: false if the thread is
+// not parked or another sender got it first
+func (handler *backgroundWorkerThread) claimParked() bool {
+	return atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(handler.parkedWord)), 1, 0)
 }
 
 func (handler *backgroundWorkerThread) name() string {
@@ -98,7 +116,7 @@ func (handler *backgroundWorkerThread) drain() {
 	q.mu.Lock()
 	s := handler.stopSock
 	handler.stopSock = -1
-	handler.parked = false
+	handler.setParked(0)
 	q.mu.Unlock()
 
 	if s >= 0 {
@@ -170,7 +188,7 @@ func (handler *backgroundWorkerThread) beforeScriptExecution() string {
 // setupScript marks the thread as a background worker on the C side and
 // takes ownership of the Go side's end of its stop socket pair.
 func (handler *backgroundWorkerThread) setupScript() error {
-	s := int64(C.frankenphp_set_background_worker_and_get_stop_sock())
+	s := int64(C.frankenphp_set_background_worker_and_get_stop_sock(handler.parkedWord, handler.worker.taskWords))
 	if s < 0 {
 		return fmt.Errorf("failed to create the stop socket pair of background worker %q", handler.worker.qualifiedName)
 	}

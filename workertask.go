@@ -66,6 +66,15 @@ type taskQueue struct {
 	next    int // thread to signal first, spreads tasks over a pool
 }
 
+// pendingWord is the count of queued tasks the scripts' threads read in C
+// before parking, see frankenphp_worker_handle_read; kept in step with
+// pending under the mutex, with sequentially consistent stores so a thread
+// storing its parked flag then loading the count, and a sender adding to the
+// count then claiming the flag, cannot both miss each other
+func (worker *worker) addPending(delta int32) {
+	atomic.AddInt32((*int32)(unsafe.Pointer(worker.taskWords)), delta)
+}
+
 // remove takes t out of the queue; false if a thread picked it up already
 func (q *taskQueue) remove(t *workerTask) bool {
 	q.mu.Lock()
@@ -93,8 +102,7 @@ func (worker *worker) claimParkedThread() (*backgroundWorkerThread, int64) {
 	n := len(worker.threads)
 	for i := range n {
 		thread := worker.threads[(worker.tasks.next+i)%n]
-		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.parked && handler.stopSock >= 0 {
-			handler.parked = false
+		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.stopSock >= 0 && handler.claimParked() {
 			handler.signaling.Add(1)
 			worker.tasks.next = (worker.tasks.next + i + 1) % n
 
@@ -112,7 +120,7 @@ func (worker *worker) claimAllThreads() (handlers []*backgroundWorkerThread, soc
 	worker.threadMutex.RLock()
 	for _, thread := range worker.threads {
 		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.stopSock >= 0 {
-			handler.parked = false
+			handler.setParked(0)
 			handler.signaling.Add(1)
 			handlers = append(handlers, handler)
 			socks = append(socks, handler.stopSock)
@@ -280,6 +288,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	q := &w.tasks
 	q.mu.Lock()
 	q.pending = append(q.pending, t)
+	w.addPending(1)
 	handler, sock := w.claimParkedThread()
 	q.mu.Unlock()
 	if handler != nil {
@@ -369,6 +378,7 @@ func go_frankenphp_task_cancel(handle C.uintptr_t, timedOut C.bool) C.bool {
 	if !t.worker.tasks.remove(t) {
 		return false
 	}
+	t.worker.addPending(-1)
 	close(t.cancelled)
 
 	name := t.worker.qualifiedName
@@ -388,20 +398,20 @@ func go_frankenphp_task_cancel(handle C.uintptr_t, timedOut C.bool) C.bool {
 	return true
 }
 
-// go_frankenphp_background_worker_wait is called before a script blocks on
-// its handle, a read or a select cast: the thread parks unless tasks are
-// queued, in which case the script must dequeue them first. For a read the
-// line then comes from the read op itself; a select needs a real one on the
-// socket. Under tasks.mu, so a task queued after the check finds the thread
-// parked and signals it: no wake-up is lost either way. The flag stays set
-// when the read returns for another reason than a claim, a stale line or
-// EOF: a claim meanwhile writes a line the script reads on its next pass.
+// go_frankenphp_background_worker_wait is called before a script casts its
+// handle for a select: the thread parks unless tasks are queued, in which
+// case a line on the socket makes the select return at once. A read parks
+// without a callback, see frankenphp_worker_handle_read. Under tasks.mu, so
+// a task queued after the check finds the thread parked and signals it. The
+// flag stays set when the read returns for another reason than a claim, a
+// stale line or EOF: a claim meanwhile writes a line the script reads on
+// its next pass.
 //
 //export go_frankenphp_background_worker_wait
-func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t, forSelect C.bool) C.bool {
+func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t) {
 	handler, ok := phpThreads[threadIndex].handler.(*backgroundWorkerThread)
 	if !ok {
-		return false
+		return
 	}
 
 	q := &handler.worker.tasks
@@ -409,15 +419,13 @@ func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t, forSelect C.b
 	defer q.mu.Unlock()
 
 	if len(q.pending) == 0 {
-		handler.parked = true
+		handler.setParked(1)
 
-		return false
+		return
 	}
-	if bool(forSelect) && handler.stopSock >= 0 {
+	if handler.stopSock >= 0 {
 		C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
 	}
-
-	return true
 }
 
 //export go_frankenphp_receive_task
@@ -437,6 +445,7 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	}
 	t := q.pending[0]
 	q.pending = slices.Delete(q.pending, 0, 1)
+	handler.worker.addPending(-1)
 	// the payload moves to request memory on the C side
 	payload := t.payload
 	t.payload = nil

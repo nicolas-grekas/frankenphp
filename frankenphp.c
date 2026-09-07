@@ -133,6 +133,11 @@ static THREAD_LOCAL php_socket_t worker_stop_socks[2] = {SOCK_ERR, SOCK_ERR};
 /* set on the first wait on the handle of the current run, see
  * frankenphp_worker_handle_ops */
 static THREAD_LOCAL bool worker_handle_waited = false;
+/* The park handshake of a background worker thread, in memory shared with
+ * the Go side: the thread's parked flag and the count of tasks queued for
+ * its worker, see frankenphp_worker_handle_read. */
+static THREAD_LOCAL int32_t *worker_parked_word = NULL;
+static THREAD_LOCAL int32_t *worker_pending_word = NULL;
 static THREAD_LOCAL HashTable *sandboxed_env = NULL;
 /* prepared_env holds entries from php(_server)'s `env KEY VAL`, exposed to
  * getenv() and merged into $_ENV when 'E' is in variables_order. Separate from
@@ -463,9 +468,12 @@ static void frankenphp_worker_close_stop_socks(void) {
  * so a later recycle won't double-close it). Returns -1 if the pair could
  * not be created. max_execution_time is disarmed after php_request_startup()
  * re-arms it, see php_thread(). */
-intptr_t frankenphp_set_background_worker_and_get_stop_sock(void) {
+intptr_t frankenphp_set_background_worker_and_get_stop_sock(int32_t *parked,
+                                                            int32_t *pending) {
   is_background_worker = true;
   worker_handle_waited = false;
+  worker_parked_word = parked;
+  worker_pending_word = pending;
 
   frankenphp_worker_close_stop_socks();
   if (frankenphp_sock_pair_open(worker_stop_socks) != 0) {
@@ -571,6 +579,8 @@ void frankenphp_update_local_thread_context(bool is_worker) {
    * do not own it and were destroyed by request shutdown. */
   if (is_background_worker) {
     is_background_worker = false;
+    worker_parked_word = NULL;
+    worker_pending_word = NULL;
     frankenphp_worker_close_stop_socks();
   }
 
@@ -1278,14 +1288,23 @@ static ssize_t frankenphp_worker_handle_read(php_stream *stream, char *buf,
                                              size_t count) {
   frankenphp_worker_handle_waited();
 
-  /* park, unless tasks are queued: then the line comes from here, without a
-   * round trip through the socket */
-  uintptr_t idx = frankenphp_thread_index();
-  if (count >= sizeof("task\n") - 1 &&
-      go_frankenphp_background_worker_wait(idx, false)) {
-    memcpy(buf, "task\n", sizeof("task\n") - 1);
+  /* Park, unless tasks are queued: then the line comes from here, without
+   * a round trip through the socket. No callback: the parked flag is stored
+   * before the pending count is loaded, and a sender adds to the count
+   * before claiming the flag, both sequentially consistent, so either the
+   * count is seen here or the flag is seen there. A failed unclaim means a
+   * sender claimed the thread meanwhile, its line is on its way. */
+  if (count >= sizeof("task\n") - 1 && worker_parked_word != NULL) {
+    __atomic_store_n(worker_parked_word, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(worker_pending_word, __ATOMIC_SEQ_CST) > 0) {
+      int32_t parked = 1;
+      if (__atomic_compare_exchange_n(worker_parked_word, &parked, 0, false,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        memcpy(buf, "task\n", sizeof("task\n") - 1);
 
-    return sizeof("task\n") - 1;
+        return sizeof("task\n") - 1;
+      }
+    }
   }
 
   return php_stream_socket_ops.read(stream, buf, count);
@@ -1297,7 +1316,7 @@ static int frankenphp_worker_handle_cast(php_stream *stream, int castas,
     frankenphp_worker_handle_waited();
     /* park for the select; tasks queued meanwhile land as a line on the
      * socket, so the select returns at once */
-    go_frankenphp_background_worker_wait(frankenphp_thread_index(), true);
+    go_frankenphp_background_worker_wait(frankenphp_thread_index());
   }
 
   return php_stream_socket_ops.cast(stream, castas, ret);

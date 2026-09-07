@@ -202,7 +202,8 @@ void frankenphp_force_kill_thread(force_kill_slot slot);
 void frankenphp_release_thread_for_kill(force_kill_slot slot);
 
 /* Background worker primitives. */
-intptr_t frankenphp_set_background_worker_and_get_stop_sock(void);
+intptr_t frankenphp_set_background_worker_and_get_stop_sock(int32_t *parked,
+                                                            int32_t *pending);
 void frankenphp_close_sock(intptr_t s);
 void frankenphp_worker_signal_task(intptr_t s);
 int frankenphp_task_chan_open(intptr_t fds[2]);

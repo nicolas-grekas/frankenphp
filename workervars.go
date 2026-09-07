@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"unsafe"
 )
 
 // varsSlot holds the snapshot a background worker published through
@@ -107,6 +108,10 @@ func freeWorkerVars() {
 			w.vars.table = nil
 		}
 		w.vars.mu.Unlock()
+		if w.taskWords != nil {
+			C.free(unsafe.Pointer(w.taskWords))
+			w.taskWords = nil
+		}
 	}
 }
 
