@@ -157,6 +157,37 @@ func BenchmarkTaskConcurrent(b *testing.B) {
 	}
 }
 
+// BenchmarkTaskBaselineConcurrent is the cost of plain requests under the
+// same concurrency as the task benchmarks: the environment's own wake-up
+// cost under load
+func BenchmarkTaskBaselineConcurrent(b *testing.B) {
+	for _, senders := range []int{1, 4, 8, 16} {
+		b.Run(fmt.Sprintf("senders=%d", senders), func(b *testing.B) {
+			server := initTaskBench(b, 1, senders)
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			requests := make(chan struct{}, b.N)
+			for range b.N {
+				requests <- struct{}{}
+			}
+			close(requests)
+			for range senders {
+				wg.Go(func() {
+					for range requests {
+						w := httptest.NewRecorder()
+						if err := server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/vars.php?name=echo", nil)); err != nil {
+							b.Error(err)
+						}
+					}
+				})
+			}
+			wg.Wait()
+			b.StopTimer()
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "req/s")
+		})
+	}
+}
+
 // BenchmarkTaskBaseline is the cost of a request to a trivial script, for
 // scale
 func BenchmarkTaskBaseline(b *testing.B) {

@@ -3,6 +3,7 @@ package frankenphp
 // #include "frankenphp.h"
 import "C"
 import (
+	"os"
 	"runtime/cgo"
 	"slices"
 	"strconv"
@@ -17,7 +18,14 @@ const taskUpdatesMax = 16
 // taskSignalEscalation bounds how long a task waits on the one thread it was
 // signaled to: past it every thread gets the line, so a script that parked
 // its handle without reading it does not hold the task
-const taskSignalEscalation = 10 * time.Millisecond
+var taskSignalEscalation = 10 * time.Millisecond
+
+// bench only: FRANKENPHP_TASK_ESCALATION_MS overrides the escalation delay
+func init() {
+	if ms, err := strconv.Atoi(os.Getenv("FRANKENPHP_TASK_ESCALATION_MS")); err == nil && ms > 0 {
+		taskSignalEscalation = time.Duration(ms) * time.Millisecond
+	}
+}
 
 // workerTask is a unit of work handed by a PHP thread to a thread of a
 // background worker, see frankenphp_send_task(). The payload and the

@@ -2,7 +2,7 @@
 
 // Bg worker of the benchmarks: answers each task with the number of updates
 // its payload asks for, the last one echoing the payload back, and publishes
-// its average per-call timings (ns) with frankenphp_set_vars() every 1000
+// its average per-call timings (ns) with frankenphp_set_vars() every 100
 // tasks, for the sender to report. wakeups counts the lines read on the
 // handle, empty_wakeups those that found no task (a pool sibling took it).
 set_time_limit(0);
@@ -38,7 +38,7 @@ while (false !== fgets($handle)) {
         $t4 = hrtime(true);
         $update += $t3 - $t2;
         $close += $t4 - $t3;
-        if (0 === ++$tasks % 1000) {
+        if (0 === ++$tasks % 100) {
             frankenphp_set_vars([
                 'tasks' => $tasks,
                 'wakeups' => $wakeups,
