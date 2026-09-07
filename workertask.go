@@ -280,8 +280,9 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	// kernel rather than in a Go select: waking a thread parked inside a Go
 	// callback costs the scheduler a hand-off, a signal on a descriptor does
 	// not. The thread taking the task sends it, the watcher does when the
-	// wait must end without a pickup
-	go t.watch(drainChan)
+	// wait must end without a pickup. The shutdown channel is read here, on
+	// the PHP thread: the goroutine may only get to run after Shutdown()
+	go t.watch(drainChan, mainThread.done)
 
 	return C.uintptr_t(t.handle), C.intptr_t(t.fds[0]), nil
 }
@@ -289,7 +290,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 // watch escalates the wake-up when the thread signaled first does not come
 // and ends the sender's wait when its thread is drained or FrankenPHP shuts
 // down; it returns once the task is picked up or the sender gave up
-func (t *workerTask) watch(drainChan <-chan struct{}) {
+func (t *workerTask) watch(drainChan, shutdown <-chan struct{}) {
 	escalate := time.NewTimer(taskSignalEscalation)
 	defer escalate.Stop()
 
@@ -313,7 +314,7 @@ func (t *workerTask) watch(drainChan <-chan struct{}) {
 			t.abort("frankenphp_send_task(): the calling thread is restarting or shutting down")
 
 			return
-		case <-mainThread.done:
+		case <-shutdown:
 			t.abort("frankenphp_send_task(): FrankenPHP is shutting down")
 
 			return
