@@ -22,8 +22,13 @@ const taskUpdatesMax = 16
 // update, EOF once the receiver closed its stream.
 type workerTask struct {
 	handle   cgo.Handle
+	worker   *worker
 	payload  *C.HashTable  // owned by the task until a thread picks it up
 	pickedUp chan struct{} // closed when a thread picks the task up
+	// receiver and pickedUpAt are set by the thread that picked the task
+	// up and read by its close, on the same thread
+	receiver   *backgroundWorkerThread
+	pickedUpAt time.Time
 	// socks[0] is the sender's end and socks[1] the receiver's: each moves
 	// to the stream of its side when that side gets the task, -1 from then
 	// on; the ones still here are closed with the task
@@ -134,6 +139,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	}
 
 	t := &workerTask{
+		worker:    w,
 		payload:   payload,
 		pickedUp:  make(chan struct{}),
 		socks:     [2]int64{int64(socks[0]), int64(socks[1])},
@@ -146,6 +152,8 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	q.mu.Lock()
 	q.pending = append(q.pending, t)
 	w.signalTask()
+	// queued like a request would be: a background worker has no other queue
+	metrics.QueuedWorkerRequest(w.qualifiedName)
 	q.mu.Unlock()
 
 	// a busy worker pushes back on its senders: wait for a thread to pick
@@ -158,10 +166,12 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	}
 
 	var err error
+	timedOut := false
 	select {
 	case <-t.pickedUp:
 	case <-timeout:
 		err = errors.New("frankenphp_send_task(): no thread of background worker " + strconv.Quote(workerName) + " picked up the task in time")
+		timedOut = true
 	case <-drainChan:
 		err = errors.New("frankenphp_send_task(): the calling thread is restarting or shutting down")
 	case <-mainThread.done:
@@ -172,6 +182,10 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		err = nil
 	}
 	if err != nil {
+		metrics.DequeuedWorkerRequest(w.qualifiedName)
+		if timedOut {
+			metrics.WorkerTaskOutcome(w.qualifiedName, TaskOutcomeTimeout)
+		}
 		t.free()
 
 		return 0, -1, C.CString(err.Error())
@@ -201,6 +215,7 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	}
 	t := q.pending[0]
 	q.pending = slices.Delete(q.pending, 0, 1)
+	metrics.DequeuedWorkerRequest(handler.worker.qualifiedName)
 	// the payload moves to request memory and the receiver's end of the
 	// pair to the receiver's stream, both on the C side
 	payload := t.payload
@@ -209,6 +224,14 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	t.socks[1] = -1
 	q.mu.Unlock()
 	close(t.pickedUp)
+
+	t.receiver = handler
+	t.pickedUpAt = time.Now()
+	metrics.StartWorkerTask(handler.worker.qualifiedName)
+	// busy on the threads endpoint while it holds a task
+	if handler.openTasks++; handler.openTasks == 1 {
+		handler.state.MarkAsWaiting(false)
+	}
 
 	return C.uintptr_t(t.handle), payload, C.intptr_t(sock)
 }
@@ -269,8 +292,25 @@ func go_frankenphp_task_receiver_close(handle C.uintptr_t, aborted C.bool) {
 	t.mu.Lock()
 	t.closed = true
 	t.aborted = bool(aborted)
+	// the first side to close settles the outcome
+	settled := !t.senderGone
 	t.cond.Broadcast()
 	t.mu.Unlock()
+
+	name := t.worker.qualifiedName
+	metrics.StopWorkerTask(name, time.Since(t.pickedUpAt))
+	if settled {
+		outcome := TaskOutcomeCompleted
+		if aborted {
+			outcome = TaskOutcomeAborted
+		}
+		metrics.WorkerTaskOutcome(name, outcome)
+	}
+	handler := t.receiver
+	handler.openTasks--
+	if handler.openTasks == 0 && !handler.isBootingScript {
+		handler.state.MarkAsWaiting(true)
+	}
 
 	t.retire()
 }
@@ -281,11 +321,16 @@ func go_frankenphp_task_sender_close(handle C.uintptr_t) {
 
 	t.mu.Lock()
 	t.senderGone = true
+	// the first side to close settles the outcome
+	settled := !t.closed
 	updates := t.updates
 	t.updates = nil
 	t.cond.Broadcast()
 	t.mu.Unlock()
 
+	if settled {
+		metrics.WorkerTaskOutcome(t.worker.qualifiedName, TaskOutcomeAbandoned)
+	}
 	for _, update := range updates {
 		C.frankenphp_vars_free(update)
 	}
