@@ -1456,14 +1456,14 @@ PHP_FUNCTION(frankenphp_send_task) {
   /* the Go side owns the payload from here on, it frees it on failure */
   struct go_frankenphp_send_task_return task =
       go_frankenphp_send_task(frankenphp_thread_index(), ZSTR_VAL(name),
-                              ZSTR_LEN(name), Z_ARRVAL(persistent), timeout_ms);
+                              ZSTR_LEN(name), Z_ARRVAL(persistent));
   if (task.r2 != NULL) {
     zend_throw_exception(spl_ce_RuntimeException, task.r2, 0);
     free(task.r2);
     RETURN_THROWS();
   }
 
-  /* a thread has the task from here on: a bailout (memory limit) must not
+  /* the task is queued from here on: a bailout (memory limit) must not
    * leave the sender's side open, the receiver would wait on it forever */
   php_stream *stream = NULL;
   zend_try {
@@ -1477,11 +1477,54 @@ PHP_FUNCTION(frankenphp_send_task) {
     stream = php_stream_alloc(&frankenphp_task_sender_ops, data, NULL, "r");
   }
   zend_catch {
+    go_frankenphp_task_cancel(task.r0, false);
     go_frankenphp_task_sender_close(task.r0);
     frankenphp_close_sock(task.r1);
     zend_bailout();
   }
   zend_end_try();
+
+  /* wait for the pickup in the kernel: the thread taking the task writes a
+   * byte on the other end of the pair, the Go side does when the wait must
+   * end without a pickup, see go_frankenphp_send_task */
+  php_socket_t sock = (php_socket_t)task.r1;
+  int poll_timeout =
+      timeout_ms < 0 ? -1 : (timeout_ms > INT_MAX ? INT_MAX : (int)timeout_ms);
+  for (;;) {
+    int n = php_pollfd_for_ms(sock, PHP_POLLREADABLE, poll_timeout);
+    if (n < 0 && php_socket_errno() == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      /* nobody took the task in time, unless right now */
+      if (go_frankenphp_task_cancel(task.r0, true)) {
+        php_stream_close(stream);
+        zend_throw_exception_ex(spl_ce_RuntimeException, 0,
+                                "frankenphp_send_task(): no thread of "
+                                "background worker \"%s\" picked up the "
+                                "task in time",
+                                ZSTR_VAL(name));
+        RETURN_THROWS();
+      }
+
+      break;
+    }
+
+    char byte;
+    (void)recv(sock, &byte, 1, 0);
+    struct go_frankenphp_task_await_return state =
+        go_frankenphp_task_await(task.r0);
+    if (state.r0 == 1) {
+      break;
+    }
+    if (state.r0 == 2) {
+      go_frankenphp_task_cancel(task.r0, false);
+      php_stream_close(stream);
+      zend_throw_exception(spl_ce_RuntimeException, state.r1, 0);
+      free(state.r1);
+      RETURN_THROWS();
+    }
+  }
 
   php_stream_to_zval(stream, return_value);
 }
