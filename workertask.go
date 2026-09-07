@@ -88,12 +88,13 @@ func (q *taskQueue) remove(t *workerTask) bool {
 	return true
 }
 
-// signalTask wakes one parked thread of the worker with the line its script
-// reads on the handle, round-robin over the pool; a thread claimed this way
-// is no longer parked. False when no thread is parked: the task then waits
-// in the queue for a thread to drain it or to park, see
-// go_frankenphp_background_worker_wait. Called with tasks.mu held
-func (worker *worker) signalTask() bool {
+// claimParkedThread picks one parked thread of the worker, round-robin over
+// the pool, and returns its stop socket to write the wake-up line to, or -1
+// when no thread is parked: the task then waits in the queue for a thread to
+// drain it or to park, see go_frankenphp_background_worker_wait. The thread
+// is no longer parked once claimed. Called with tasks.mu held; the caller
+// writes after releasing it and calls doneSignaling on the handler
+func (worker *worker) claimParkedThread() (*backgroundWorkerThread, int64) {
 	worker.threadMutex.RLock()
 	defer worker.threadMutex.RUnlock()
 
@@ -102,27 +103,42 @@ func (worker *worker) signalTask() bool {
 		thread := worker.threads[(worker.tasks.next+i)%n]
 		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.parked && handler.stopSock >= 0 {
 			handler.parked = false
+			handler.signaling.Add(1)
 			worker.tasks.next = (worker.tasks.next + i + 1) % n
-			C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
 
-			return true
+			return handler, handler.stopSock
 		}
 	}
 
-	return false
+	return nil, -1
 }
 
-// signalAllThreads is the fallback of taskSignalEscalation: every thread of
-// the worker gets the line, parked or not; called with tasks.mu held
-func (worker *worker) signalAllThreads() {
+// claimAllThreads is the fallback of taskSignalEscalation: every thread of
+// the worker gets the line, parked or not. Called with tasks.mu held, the
+// caller writes to the sockets after releasing it
+func (worker *worker) claimAllThreads() (handlers []*backgroundWorkerThread, socks []int64) {
 	worker.threadMutex.RLock()
 	for _, thread := range worker.threads {
 		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.stopSock >= 0 {
 			handler.parked = false
-			C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
+			handler.signaling.Add(1)
+			handlers = append(handlers, handler)
+			socks = append(socks, handler.stopSock)
 		}
 	}
 	worker.threadMutex.RUnlock()
+
+	return handlers, socks
+}
+
+// signalThreads writes the wake-up line to sockets claimed under tasks.mu,
+// after it was released: the write is a syscall, and a thread contending
+// for the mutex meanwhile would park at the price of a scheduler hand-off
+func signalThreads(handlers []*backgroundWorkerThread, socks []int64) {
+	for i, s := range socks {
+		C.frankenphp_worker_signal_task(C.intptr_t(s))
+		handlers[i].signaling.Add(-1)
+	}
 }
 
 // retire counts a side done with the task; the last one frees it
@@ -191,13 +207,16 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	t.cond = sync.NewCond(&t.mu)
 	t.handle = cgo.NewHandle(t)
 
+	// queued like a request would be: a background worker has no other queue
+	metrics.QueuedWorkerRequest(w.qualifiedName)
 	q := &w.tasks
 	q.mu.Lock()
 	q.pending = append(q.pending, t)
-	w.signalTask()
-	// queued like a request would be: a background worker has no other queue
-	metrics.QueuedWorkerRequest(w.qualifiedName)
+	handler, sock := w.claimParkedThread()
 	q.mu.Unlock()
+	if handler != nil {
+		signalThreads([]*backgroundWorkerThread{handler}, []int64{sock})
+	}
 
 	// the C side waits for the pickup on the sender's end of the pair, in the
 	// kernel rather than in a Go select: waking a thread parked inside a Go
@@ -229,10 +248,13 @@ func (t *workerTask) watch(drainChan <-chan struct{}) {
 		case <-escalate.C:
 			q := &t.worker.tasks
 			q.mu.Lock()
+			var handlers []*backgroundWorkerThread
+			var socks []int64
 			if slices.Contains(q.pending, t) {
-				t.worker.signalAllThreads()
+				handlers, socks = t.worker.claimAllThreads()
 			}
 			q.mu.Unlock()
+			signalThreads(handlers, socks)
 		case <-drainChan:
 			t.abort("frankenphp_send_task(): the calling thread is restarting or shutting down")
 
@@ -318,7 +340,9 @@ func go_frankenphp_task_cancel(handle C.uintptr_t, timedOut C.bool) C.bool {
 // queued, in which case the script must dequeue them first. For a read the
 // line then comes from the read op itself; a select needs a real one on the
 // socket. Under tasks.mu, so a task queued after the check finds the thread
-// parked and signals it: no wake-up is lost either way.
+// parked and signals it: no wake-up is lost either way. The flag stays set
+// when the read returns for another reason than a claim, a stale line or
+// EOF: a claim meanwhile writes a line the script reads on its next pass.
 //
 //export go_frankenphp_background_worker_wait
 func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t, forSelect C.bool) C.bool {
@@ -343,22 +367,6 @@ func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t, forSelect C.b
 	return true
 }
 
-// go_frankenphp_background_worker_woke is called once a read on the handle
-// returned: the script is running again
-//
-//export go_frankenphp_background_worker_woke
-func go_frankenphp_background_worker_woke(threadIndex C.uintptr_t) {
-	handler, ok := phpThreads[threadIndex].handler.(*backgroundWorkerThread)
-	if !ok {
-		return
-	}
-
-	q := &handler.worker.tasks
-	q.mu.Lock()
-	handler.parked = false
-	q.mu.Unlock()
-}
-
 //export go_frankenphp_receive_task
 func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTable, C.intptr_t) {
 	handler, ok := phpThreads[threadIndex].handler.(*backgroundWorkerThread)
@@ -376,7 +384,6 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	}
 	t := q.pending[0]
 	q.pending = slices.Delete(q.pending, 0, 1)
-	metrics.DequeuedWorkerRequest(handler.worker.qualifiedName)
 	// the payload moves to request memory and the receiver's end of the
 	// pair to the receiver's stream, both on the C side
 	payload := t.payload
@@ -384,6 +391,7 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	sock := t.socks[1]
 	t.socks[1] = -1
 	q.mu.Unlock()
+	metrics.DequeuedWorkerRequest(handler.worker.qualifiedName)
 	close(t.pickedUp)
 	// wakes the sender's wait for the pickup, see go_frankenphp_send_task;
 	// after the channel, so the sender finds it closed once woken

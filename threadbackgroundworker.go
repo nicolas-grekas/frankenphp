@@ -7,6 +7,8 @@ import "C"
 import (
 	"fmt"
 	"log/slog"
+	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/dunglas/frankenphp/internal/state"
@@ -54,6 +56,13 @@ type backgroundWorkerThread struct {
 	// for a select, and no task is queued: senders wake one parked thread
 	// per task. Guarded by worker.tasks.mu.
 	parked bool
+
+	// signaling counts the senders writing to stopSock outside of
+	// worker.tasks.mu, so the socket is only closed once they are done: the
+	// write is a syscall, holding the mutex across it would make every
+	// contending thread park, and threads inside a cgo callback park at the
+	// price of a scheduler hand-off
+	signaling atomic.Int32
 }
 
 // backgroundBootWarnDelay is how long a run may go without waiting on its
@@ -93,6 +102,10 @@ func (handler *backgroundWorkerThread) drain() {
 	q.mu.Unlock()
 
 	if s >= 0 {
+		// senders that took the socket before it was withdrawn finish their write first
+		for handler.signaling.Load() > 0 {
+			runtime.Gosched()
+		}
 		C.frankenphp_close_sock(C.intptr_t(s))
 	}
 }

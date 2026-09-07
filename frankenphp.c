@@ -1235,10 +1235,8 @@ static ssize_t frankenphp_worker_handle_read(php_stream *stream, char *buf,
 
     return sizeof("task\n") - 1;
   }
-  ssize_t n = php_stream_socket_ops.read(stream, buf, count);
-  go_frankenphp_background_worker_woke(idx);
 
-  return n;
+  return php_stream_socket_ops.read(stream, buf, count);
 }
 
 static int frankenphp_worker_handle_cast(php_stream *stream, int castas,
