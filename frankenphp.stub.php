@@ -108,11 +108,11 @@ function frankenphp_read_task($stream): ?array {}
 /**
  * Dequeues a task sent to the current background worker, without blocking:
  * [$stream, $payload], or null when there is none. The handle returned by
- * frankenphp_get_worker_handle() carries a "task\n" line per task sent to
- * the worker, on every thread of it: a line is a wake-up, not a count, and
- * null after one is expected in a pool. $stream reaches EOF when the sender
- * closes its own stream, for stream_select() and feof(). Only callable from
- * inside a background worker.
+ * frankenphp_get_worker_handle() carries a "task\n" line when a task waits
+ * for the thread: a line is a wake-up, not a count, and null after one is
+ * expected in a pool. $stream reaches EOF when the sender closes its own
+ * stream, for stream_select() and feof(). Only callable from inside a
+ * background worker.
  *
  * @return array{resource, array}|null
  */

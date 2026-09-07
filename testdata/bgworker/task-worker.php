@@ -7,7 +7,9 @@
 // progress updates first, sleep_ms simulates that much work, cut short if
 // the sender closes its stream meanwhile, mark touches a file at pickup,
 // crash exits without completing the task. Exceptions land in BG_SENTINEL.
+// BG_LOOP=if takes one task per line instead of draining the queue.
 set_time_limit(0);
+$drain = 'if' !== ($_SERVER['BG_LOOP'] ?? 'while');
 $handle = frankenphp_get_worker_handle();
 while (false !== fgets($handle)) {
     while ($task = frankenphp_receive_task()) {
@@ -41,6 +43,9 @@ while (false !== fgets($handle)) {
             }
         } finally {
             fclose($stream);
+        }
+        if (!$drain) {
+            break;
         }
     }
 }

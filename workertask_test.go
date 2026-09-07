@@ -98,6 +98,27 @@ func TestTaskAbandoned(t *testing.T) {
 	assert.Contains(t, requireFileContentEventually(t, sentinel), "the sender closed the task before the update")
 }
 
+// a task queued while the only thread is busy reaches it when it reads its
+// handle again, even with a loop taking one task per line
+func TestTaskQueuedWhileBusy(t *testing.T) {
+	server, err := frankenphp.NewServer(testDataDir)
+	require.NoError(t, err)
+	initServers(t, frankenphp.WithServer(server), bgWorker("echo", "task-worker.php", map[string]string{"BG_LOOP": "if"}, server), frankenphp.WithNumThreads(3))
+
+	bodies := make(chan string, 2)
+	for _, input := range []string{"first", "second"} {
+		go func() {
+			w := httptest.NewRecorder()
+			_ = server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/task.php?sleep_ms=100&input="+input, nil))
+			b, _ := io.ReadAll(w.Result().Body)
+			bodies <- string(b)
+		}()
+	}
+	results := <-bodies + <-bodies
+	assert.Contains(t, results, `"result":"processed:first"`)
+	assert.Contains(t, results, `"result":"processed:second"`)
+}
+
 // the threads of a pool share the queue, and stream_select() works on the
 // sender's streams
 func TestTaskPool(t *testing.T) {
