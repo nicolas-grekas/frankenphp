@@ -107,14 +107,20 @@ func BenchmarkTask(b *testing.B) {
 }
 
 // BenchmarkTaskConcurrent hammers a pool from several request threads at
-// once; ns/op is per request of 100 tasks, tasks/s is the throughput
+// once; ns/op is per request of 100 tasks, tasks/s is the throughput, the
+// other metrics are averages over all the tasks
 func BenchmarkTaskConcurrent(b *testing.B) {
-	for _, tc := range []struct{ senders, num int }{{1, 1}, {4, 4}, {8, 8}, {16, 8}} {
+	for _, tc := range []struct{ senders, num int }{{1, 1}, {4, 4}, {8, 8}, {8, 16}, {16, 8}, {16, 16}} {
 		b.Run(fmt.Sprintf("senders=%d/num=%d", tc.senders, tc.num), func(b *testing.B) {
 			server := initTaskBench(b, tc.num, tc.senders)
 			taskBenchRequest(b, server, "n=100")
 			b.ResetTimer()
-			var wg sync.WaitGroup
+			var (
+				wg                                    sync.WaitGroup
+				mu                                    sync.Mutex
+				sendNs, readNs, pickupNs, wakeNs, cnt float64
+				last                                  taskBenchResult
+			)
 			requests := make(chan struct{}, b.N)
 			for range b.N {
 				requests <- struct{}{}
@@ -123,13 +129,30 @@ func BenchmarkTaskConcurrent(b *testing.B) {
 			for range tc.senders {
 				wg.Go(func() {
 					for range requests {
-						taskBenchRequest(b, server, "n=100")
+						r := taskBenchRequest(b, server, "n=100")
+						mu.Lock()
+						sendNs += float64(r.SendNs)
+						readNs += float64(r.ReadNs)
+						if r.Worker != nil {
+							pickupNs += float64(r.Worker.PickupNs)
+							wakeNs += float64(r.Worker.WakeNs)
+							last = r
+						}
+						cnt++
+						mu.Unlock()
 					}
 				})
 			}
 			wg.Wait()
 			b.StopTimer()
 			b.ReportMetric(float64(b.N*100)/b.Elapsed().Seconds(), "tasks/s")
+			b.ReportMetric(sendNs/cnt, "send-ns/task")
+			b.ReportMetric(readNs/cnt, "read-ns/task")
+			if last.Worker != nil {
+				b.ReportMetric(pickupNs/cnt, "pickup-ns/task")
+				b.ReportMetric(wakeNs/cnt, "worker-wake-ns/task")
+				b.ReportMetric(float64(last.Worker.EmptyWakeups)/float64(last.Worker.Tasks), "empty-wakeups/task")
+			}
 		})
 	}
 }
