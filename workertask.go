@@ -22,8 +22,9 @@ const taskSignalEscalation = 10 * time.Millisecond
 // workerTask is a unit of work handed by a PHP thread to a thread of a
 // background worker, see frankenphp_send_task(). The payload and the
 // updates flowing back are persistent HashTables, copied into request
-// memory on arrival. A socket pair per task wakes the sender: one byte per
-// update, EOF once the receiver closed its stream.
+// memory on arrival. Each side waits on its descriptor of the task's channel
+// and is signaled there by the other, one signal per event: pickup, update,
+// completion and abort for the sender, abandonment for the receiver.
 type workerTask struct {
 	handle   cgo.Handle
 	worker   *worker
@@ -38,14 +39,10 @@ type workerTask struct {
 	// up and read by its close, on the same thread
 	receiver   *backgroundWorkerThread
 	pickedUpAt time.Time
-	// socks[0] is the sender's end and socks[1] the receiver's: each moves
-	// to the stream of its side when that side gets the task, -1 from then
-	// on; the ones still here are closed with the task
-	socks [2]int64
-	// nudgeSock is the receiver's end, written to on each update while the
-	// receiver's stream owns it: updates come from the receiver's thread
-	// before its close, so the socket is open
-	nudgeSock int64
+	// fds[0] is the sender's descriptor, fds[1] the receiver's; the streams
+	// wait on them but the task owns them, until both sides closed and the
+	// pair goes back to the pool
+	fds [2]int64
 
 	mu         sync.Mutex
 	cond       *sync.Cond // signaled on pop and close
@@ -133,6 +130,80 @@ func signalThreads(handlers []*backgroundWorkerThread, socks []int64) {
 	}
 }
 
+// taskChanPool keeps the descriptor pairs of finished tasks for the next
+// ones: drained, they are as good as new, and creating and closing them was
+// most of a task's syscalls. Bounded so an idle server does not hold the
+// descriptors of a past peak.
+var taskChanPool struct {
+	mu   sync.Mutex
+	free [][2]int64
+}
+
+const taskChanPoolMax = 256
+
+// taskChanGet returns a drained pair from the pool, or a new one
+func taskChanGet() ([2]int64, bool) {
+	taskChanPool.mu.Lock()
+	if n := len(taskChanPool.free); n > 0 {
+		fds := taskChanPool.free[n-1]
+		taskChanPool.free = taskChanPool.free[:n-1]
+		taskChanPool.mu.Unlock()
+
+		return fds, true
+	}
+	taskChanPool.mu.Unlock()
+
+	var fds [2]C.intptr_t
+	if C.frankenphp_task_chan_open(&fds[0]) != 0 {
+		return [2]int64{}, false
+	}
+
+	return [2]int64{int64(fds[0]), int64(fds[1])}, true
+}
+
+// taskChanPut returns a pair to the pool, closed if the pool is full; the
+// syscalls happen outside of the pool mutex
+func taskChanPut(fds [2]int64) {
+	C.frankenphp_task_chan_drain(C.intptr_t(fds[0]))
+	C.frankenphp_task_chan_drain(C.intptr_t(fds[1]))
+
+	taskChanPool.mu.Lock()
+	if len(taskChanPool.free) < taskChanPoolMax {
+		taskChanPool.free = append(taskChanPool.free, fds)
+		taskChanPool.mu.Unlock()
+
+		return
+	}
+	taskChanPool.mu.Unlock()
+
+	C.frankenphp_close_sock(C.intptr_t(fds[0]))
+	C.frankenphp_close_sock(C.intptr_t(fds[1]))
+}
+
+// freeTaskChans closes the pooled pairs on shutdown
+func freeTaskChans() {
+	taskChanPool.mu.Lock()
+	free := taskChanPool.free
+	taskChanPool.free = nil
+	taskChanPool.mu.Unlock()
+
+	for _, fds := range free {
+		C.frankenphp_close_sock(C.intptr_t(fds[0]))
+		C.frankenphp_close_sock(C.intptr_t(fds[1]))
+	}
+}
+
+// signalSender wakes the sender's wait: a pickup, an update, the end of
+// the task or an abort
+func (t *workerTask) signalSender() {
+	C.frankenphp_task_chan_signal(C.intptr_t(t.fds[0]), C.intptr_t(t.fds[1]), 0)
+}
+
+// signalReceiver wakes the receiver's stream_select(): the sender is gone
+func (t *workerTask) signalReceiver() {
+	C.frankenphp_task_chan_signal(C.intptr_t(t.fds[0]), C.intptr_t(t.fds[1]), 1)
+}
+
 // retire counts a side done with the task; the last one frees it
 func (t *workerTask) retire() {
 	t.mu.Lock()
@@ -154,11 +225,7 @@ func (t *workerTask) free() {
 	for _, update := range t.updates {
 		C.frankenphp_vars_free(update)
 	}
-	for _, s := range t.socks {
-		if s >= 0 {
-			C.frankenphp_close_sock(C.intptr_t(s))
-		}
-	}
+	taskChanPut(t.fds)
 	t.handle.Delete()
 }
 
@@ -181,11 +248,11 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	// target's threads are drained too, nobody would pick the task up
 	drainChan := thread.drainChan
 
-	var socks [2]C.intptr_t
-	if C.frankenphp_task_open_sock_pair(&socks[0]) != 0 {
+	fds, ok := taskChanGet()
+	if !ok {
 		C.frankenphp_vars_free(payload)
 
-		return 0, -1, C.CString("frankenphp_send_task(): failed to create the socket pair of the task")
+		return 0, -1, C.CString("frankenphp_send_task(): failed to create the channel of the task")
 	}
 
 	t := &workerTask{
@@ -193,8 +260,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		payload:   payload,
 		pickedUp:  make(chan struct{}),
 		cancelled: make(chan struct{}),
-		socks:     [2]int64{int64(socks[0]), int64(socks[1])},
-		nudgeSock: int64(socks[1]),
+		fds:       fds,
 	}
 	t.cond = sync.NewCond(&t.mu)
 	t.handle = cgo.NewHandle(t)
@@ -210,18 +276,14 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		signalThreads([]*backgroundWorkerThread{handler}, []int64{sock})
 	}
 
-	// the C side waits for the pickup on the sender's end of the pair, in the
+	// the C side waits for the pickup on the sender's descriptor, in the
 	// kernel rather than in a Go select: waking a thread parked inside a Go
-	// callback costs the scheduler a hand-off, a byte on a socket does not.
-	// The thread taking the task writes that byte, the watcher does when the
+	// callback costs the scheduler a hand-off, a signal on a descriptor does
+	// not. The thread taking the task sends it, the watcher does when the
 	// wait must end without a pickup
 	go t.watch(drainChan)
 
-	// the sender's end now belongs to the stream returned to the script
-	s := t.socks[0]
-	t.socks[0] = -1
-
-	return C.uintptr_t(t.handle), C.intptr_t(s), nil
+	return C.uintptr_t(t.handle), C.intptr_t(t.fds[0]), nil
 }
 
 // watch escalates the wake-up when the thread signaled first does not come
@@ -259,17 +321,31 @@ func (t *workerTask) watch(drainChan <-chan struct{}) {
 	}
 }
 
-// abort ends the sender's wait for a pickup that must not happen anymore:
-// the receiver's end of the pair is still the task's own before the pickup,
-// a byte on it wakes the sender's poll
+// abort ends the sender's wait for a pickup that must not happen anymore
 func (t *workerTask) abort(reason string) {
 	q := &t.worker.tasks
 	q.mu.Lock()
 	if slices.Contains(q.pending, t) {
 		t.abortReason = reason
-		C.frankenphp_task_nudge(C.intptr_t(t.nudgeSock))
+		t.signalSender()
 	}
 	q.mu.Unlock()
+}
+
+// go_frankenphp_task_side_gone tells a stream whether the other side closed
+// its own: what feof() reports on the task streams
+//
+//export go_frankenphp_task_side_gone
+func go_frankenphp_task_side_gone(handle C.uintptr_t, sender C.bool) C.bool {
+	t := cgo.Handle(handle).Value().(*workerTask)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if bool(sender) {
+		return C.bool(t.closed)
+	}
+
+	return C.bool(t.senderGone)
 }
 
 // go_frankenphp_task_await tells the sender, woken on its socket, where its
@@ -316,8 +392,6 @@ func go_frankenphp_task_cancel(handle C.uintptr_t, timedOut C.bool) C.bool {
 
 	C.frankenphp_vars_free(t.payload)
 	t.payload = nil
-	C.frankenphp_close_sock(C.intptr_t(t.socks[1]))
-	t.socks[1] = -1
 	t.mu.Lock()
 	// nothing for the sender's close to settle
 	t.closed = true
@@ -376,18 +450,15 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	}
 	t := q.pending[0]
 	q.pending = slices.Delete(q.pending, 0, 1)
-	// the payload moves to request memory and the receiver's end of the
-	// pair to the receiver's stream, both on the C side
+	// the payload moves to request memory on the C side
 	payload := t.payload
 	t.payload = nil
-	sock := t.socks[1]
-	t.socks[1] = -1
 	q.mu.Unlock()
 	metrics.DequeuedWorkerRequest(handler.worker.qualifiedName)
 	close(t.pickedUp)
 	// wakes the sender's wait for the pickup, see go_frankenphp_send_task;
 	// after the channel, so the sender finds it closed once woken
-	C.frankenphp_task_nudge(C.intptr_t(sock))
+	t.signalSender()
 
 	t.receiver = handler
 	t.pickedUpAt = time.Now()
@@ -397,7 +468,7 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 		handler.state.MarkAsWaiting(false)
 	}
 
-	return C.uintptr_t(t.handle), payload, C.intptr_t(sock)
+	return C.uintptr_t(t.handle), payload, C.intptr_t(t.fds[1])
 }
 
 //export go_frankenphp_update_task
@@ -417,8 +488,9 @@ func go_frankenphp_update_task(handle C.uintptr_t, update *C.HashTable) *C.char 
 	t.updates = append(t.updates, update)
 	t.mu.Unlock()
 
-	// one byte per update on the sender's stream
-	C.frankenphp_task_nudge(C.intptr_t(t.nudgeSock))
+	// one signal per update, after the push: the sender consumes one per
+	// update it reads
+	t.signalSender()
 
 	return nil
 }
@@ -451,8 +523,6 @@ func go_frankenphp_read_task(handle C.uintptr_t) (*C.HashTable, C.int) {
 func go_frankenphp_task_receiver_close(handle C.uintptr_t, aborted C.bool) {
 	t := cgo.Handle(handle).Value().(*workerTask)
 
-	// the receiver's stream closes its end right after this, which lands as
-	// EOF on the sender's, behind the bytes of the updates still queued
 	t.mu.Lock()
 	t.closed = true
 	t.aborted = bool(aborted)
@@ -460,6 +530,8 @@ func go_frankenphp_task_receiver_close(handle C.uintptr_t, aborted C.bool) {
 	settled := !t.senderGone
 	t.cond.Broadcast()
 	t.mu.Unlock()
+	// the sender finds the end of the task behind the updates still queued
+	t.signalSender()
 
 	name := t.worker.qualifiedName
 	metrics.StopWorkerTask(name, time.Since(t.pickedUpAt))
@@ -491,6 +563,8 @@ func go_frankenphp_task_sender_close(handle C.uintptr_t) {
 	t.updates = nil
 	t.cond.Broadcast()
 	t.mu.Unlock()
+	// the receiver's stream_select() and feof() see it
+	t.signalReceiver()
 
 	if settled {
 		metrics.WorkerTaskOutcome(t.worker.qualifiedName, TaskOutcomeAbandoned)

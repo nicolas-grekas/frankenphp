@@ -493,22 +493,74 @@ void frankenphp_worker_signal_task(intptr_t s) {
   frankenphp_sock_send((php_socket_t)s, "task\n", sizeof("task\n") - 1);
 }
 
-/* The pair of a task: [0] for the sender's stream, [1] for the Go side. */
-int frankenphp_task_open_sock_pair(intptr_t socks[2]) {
+/* Task channels: one descriptor per side of a task, the sender's [0] and
+ * the receiver's [1], each waited on by its stream and signaled by the other
+ * side through the Go side. On Linux they are eventfds: a counter, no
+ * buffer, nothing to close between two tasks, so the Go side pools them.
+ * Elsewhere a socket pair, for Windows's php_select(); a signal to one end
+ * is a byte written to the other. Both descriptors are non-blocking: waits
+ * go through poll(), consuming a signal never blocks. Signals and events
+ * match one to one, EFD_SEMAPHORE makes a read consume a single one. */
+#ifdef __linux__
+#include <sys/eventfd.h>
+#define FRANKENPHP_TASK_CHAN_EVENTFD 1
+#endif
+
+int frankenphp_task_chan_open(intptr_t fds[2]) {
+#ifdef FRANKENPHP_TASK_CHAN_EVENTFD
+  int a = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
+  if (a < 0) {
+    return -1;
+  }
+  int b = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
+  if (b < 0) {
+    close(a);
+
+    return -1;
+  }
+  fds[0] = a;
+  fds[1] = b;
+#else
   php_socket_t pair[2];
   if (frankenphp_sock_pair_open(pair) != 0) {
     return -1;
   }
-  socks[0] = (intptr_t)pair[0];
-  socks[1] = (intptr_t)pair[1];
+  php_set_sock_blocking(pair[0], 0);
+  fds[0] = (intptr_t)pair[0];
+  fds[1] = (intptr_t)pair[1];
+#endif
 
   return 0;
 }
 
-/* One byte per update on the sender's stream, so a stream_select() or a
- * blocking read there returns, see frankenphp_read_task(). */
-void frankenphp_task_nudge(intptr_t s) {
-  frankenphp_sock_send((php_socket_t)s, "1", 1);
+/* Wakes the side waiting on fds[side]. */
+void frankenphp_task_chan_signal(intptr_t fd0, intptr_t fd1, int side) {
+#ifdef FRANKENPHP_TASK_CHAN_EVENTFD
+  uint64_t one = 1;
+  (void)!write((int)(side ? fd1 : fd0), &one, sizeof(one));
+#else
+  /* a byte on one end lands on the other */
+  frankenphp_sock_send((php_socket_t)(side ? fd0 : fd1), "1", 1);
+#endif
+}
+
+/* Consumes one signal, false when none is pending. */
+bool frankenphp_task_chan_consume(intptr_t fd) {
+#ifdef FRANKENPHP_TASK_CHAN_EVENTFD
+  uint64_t v;
+
+  return read((int)fd, &v, sizeof(v)) == (ssize_t)sizeof(v);
+#else
+  char b;
+
+  return recv((php_socket_t)fd, &b, 1, 0) == 1;
+#endif
+}
+
+/* Empties a descriptor before its pair goes back to the pool. */
+void frankenphp_task_chan_drain(intptr_t fd) {
+  while (frankenphp_task_chan_consume(fd)) {
+  }
 }
 
 void frankenphp_update_local_thread_context(bool is_worker) {
@@ -1362,45 +1414,23 @@ PHP_FUNCTION(frankenphp_get_vars) {
 
 /* Tasks, see frankenphp_send_task(): the sender hands a persistent copy of
  * the payload to the Go side, which queues it for the named background
- * worker and wakes its threads; frankenphp_receive_task() dequeues it on one
- * of them. Updates flow back the same way, persistent copies through the Go
- * side, and a socket pair per task wakes the sender: one byte per update,
- * EOF once the receiver closed its stream. */
-
-/* The sender's stream is a socket stream over its end of the pair: it owns
- * the socket, and closing it abandons the task. */
+ * worker and wakes one of its threads; frankenphp_receive_task() dequeues it
+ * there. Updates flow back the same way, persistent copies through the Go
+ * side. Each side has a stream over its descriptor of the task's channel:
+ * the stream carries no data, it is what stream_select() waits on and what
+ * fclose() ends, and the Go side holds the state the functions report. The
+ * descriptors belong to the task until both sides closed. */
 typedef struct {
-  /* first, the socket ops read stream->abstract as this */
-  php_netstream_data_t sock;
   uintptr_t task;
-} frankenphp_task_sender_data;
+  intptr_t fd;    /* the side's descriptor, see frankenphp_task_chan_open */
+  int timeout_ms; /* stream_set_timeout(), -1 waits forever */
+  bool sender;
+  bool timed_out;
+  bool settled; /* the end of the task was reported, its signal consumed */
+} frankenphp_task_stream_data;
 
-/* The receiver's stream is a socket stream over the other end of the pair:
- * updates go through frankenphp_update_task(), the stream itself only
- * reports the sender's close, as EOF to stream_select() and feof(). Closing
- * it completes the task, unless the close is the resource cleanup of request
- * shutdown, where the script ended with the task open and the sender is told
- * so. */
-typedef struct {
-  /* first, the socket ops read stream->abstract as this */
-  php_netstream_data_t sock;
-  uintptr_t task;
-} frankenphp_task_receiver_data;
-
-/* the socket ops, except for close on both and write on the receiver's;
- * initialized in MINIT */
-static php_stream_ops frankenphp_task_sender_ops;
-static php_stream_ops frankenphp_task_receiver_ops;
-
-static int frankenphp_task_sender_close(php_stream *stream, int close_handle) {
-  frankenphp_task_sender_data *data = stream->abstract;
-  go_frankenphp_task_sender_close(data->task);
-
-  return php_stream_socket_ops.close(stream, close_handle);
-}
-
-static ssize_t frankenphp_task_receiver_write(php_stream *stream,
-                                              const char *buf, size_t count) {
+static ssize_t frankenphp_task_stream_write(php_stream *stream, const char *buf,
+                                            size_t count) {
   (void)stream;
   (void)buf;
   (void)count;
@@ -1408,15 +1438,126 @@ static ssize_t frankenphp_task_receiver_write(php_stream *stream,
   return -1;
 }
 
-/* the Go side learns the outcome before the socket closes, so the sender's
- * read at EOF finds it */
-static int frankenphp_task_receiver_close(php_stream *stream,
-                                          int close_handle) {
-  frankenphp_task_receiver_data *data = stream->abstract;
-  go_frankenphp_task_receiver_close(data->task,
-                                    (EG(flags) & EG_FLAGS_IN_SHUTDOWN) != 0);
+/* the data goes through the frankenphp_*_task() functions */
+static ssize_t frankenphp_task_stream_read(php_stream *stream, char *buf,
+                                           size_t count) {
+  (void)buf;
+  (void)count;
+  frankenphp_task_stream_data *data = stream->abstract;
+  if (go_frankenphp_task_side_gone(data->task, data->sender)) {
+    stream->eof = 1;
+  }
 
-  return php_stream_socket_ops.close(stream, close_handle);
+  return -1;
+}
+
+/* Closing the receiver's stream completes the task, unless the close is the
+ * resource cleanup of request shutdown, where the script ended with the task
+ * open and the sender is told so; closing the sender's abandons it. The Go
+ * side learns it before signaling the other side, which then finds it. */
+static int frankenphp_task_stream_close(php_stream *stream, int close_handle) {
+  (void)close_handle;
+  frankenphp_task_stream_data *data = stream->abstract;
+  if (data->sender) {
+    go_frankenphp_task_sender_close(data->task);
+  } else {
+    go_frankenphp_task_receiver_close(data->task,
+                                      (EG(flags) & EG_FLAGS_IN_SHUTDOWN) != 0);
+  }
+  efree(data);
+
+  return 0;
+}
+
+static int frankenphp_task_stream_cast(php_stream *stream, int castas,
+                                       void **ret) {
+  if (castas != PHP_STREAM_AS_FD_FOR_SELECT) {
+    return FAILURE;
+  }
+  if (ret != NULL) {
+    frankenphp_task_stream_data *data = stream->abstract;
+    *(php_socket_t *)ret = (php_socket_t)data->fd;
+  }
+
+  return SUCCESS;
+}
+
+static int frankenphp_task_stream_set_option(php_stream *stream, int option,
+                                             int value, void *ptrparam) {
+  (void)value;
+  frankenphp_task_stream_data *data = stream->abstract;
+  switch (option) {
+  case PHP_STREAM_OPTION_READ_TIMEOUT: {
+    struct timeval *tv = ptrparam;
+    data->timeout_ms =
+        tv->tv_sec < 0 ? -1 : (int)(tv->tv_sec * 1000 + tv->tv_usec / 1000);
+
+    return PHP_STREAM_OPTION_RETURN_OK;
+  }
+  case PHP_STREAM_OPTION_CHECK_LIVENESS:
+    /* feof(): the other side closed its stream */
+    return go_frankenphp_task_side_gone(data->task, data->sender)
+               ? PHP_STREAM_OPTION_RETURN_ERR
+               : PHP_STREAM_OPTION_RETURN_OK;
+  case PHP_STREAM_OPTION_META_DATA_API:
+    add_assoc_bool((zval *)ptrparam, "timed_out", data->timed_out);
+    add_assoc_bool((zval *)ptrparam, "blocked", 1);
+    add_assoc_bool((zval *)ptrparam, "eof", stream->eof);
+
+    return PHP_STREAM_OPTION_RETURN_OK;
+  default:
+    return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+  }
+}
+
+#define FRANKENPHP_TASK_STREAM_OPS(label)                                      \
+  {                                                                            \
+    frankenphp_task_stream_write, frankenphp_task_stream_read,                 \
+        frankenphp_task_stream_close, NULL, label, NULL,                       \
+        frankenphp_task_stream_cast, NULL, frankenphp_task_stream_set_option   \
+  }
+static const php_stream_ops frankenphp_task_sender_ops =
+    FRANKENPHP_TASK_STREAM_OPS("FrankenPHP task sender");
+static const php_stream_ops frankenphp_task_receiver_ops =
+    FRANKENPHP_TASK_STREAM_OPS("FrankenPHP task receiver");
+
+static php_stream *frankenphp_task_stream_open(uintptr_t task, intptr_t fd,
+                                               bool sender) {
+  frankenphp_task_stream_data *data = ecalloc(1, sizeof(*data));
+  data->task = task;
+  data->fd = fd;
+  data->timeout_ms = -1;
+  data->sender = sender;
+
+  return php_stream_alloc(sender ? &frankenphp_task_sender_ops
+                                 : &frankenphp_task_receiver_ops,
+                          data, NULL, "r");
+}
+
+/* Waits for a signal on the side's descriptor without consuming it: 1 when
+ * one is pending, 0 on timeout. Interrupted polls are retried, like PHP's
+ * own stream code does. */
+static int frankenphp_task_stream_poll(frankenphp_task_stream_data *data,
+                                       int timeout_ms) {
+  for (;;) {
+    int n =
+        php_pollfd_for_ms((php_socket_t)data->fd, PHP_POLLREADABLE, timeout_ms);
+    if (n < 0 && php_socket_errno() == EINTR) {
+      continue;
+    }
+
+    return n > 0;
+  }
+}
+
+/* Consumes the signal of an event the Go side reported, waiting for it if
+ * the other side has not written it yet: the state is set before the
+ * signal, so the wait is momentary, and one signal per event keeps
+ * stream_select() exact. */
+static void frankenphp_task_stream_consume(frankenphp_task_stream_data *data) {
+  while (!frankenphp_task_chan_consume(data->fd)) {
+    frankenphp_task_stream_poll(data, -1);
+  }
 }
 
 PHP_FUNCTION(frankenphp_send_task) {
@@ -1436,9 +1577,9 @@ PHP_FUNCTION(frankenphp_send_task) {
     RETURN_THROWS();
   }
   /* past what a duration holds, infinity included, waits forever like null */
-  long long timeout_ms = -1;
-  if (!timeout_is_null && timeout * 1000 < 9e15) {
-    timeout_ms = (long long)(timeout * 1000);
+  int timeout_ms = -1;
+  if (!timeout_is_null && timeout * 1000 < (double)INT_MAX) {
+    timeout_ms = (int)(timeout * 1000);
   }
   if (!persistent_zval_validate(payload)) {
     zend_value_error(
@@ -1464,36 +1605,20 @@ PHP_FUNCTION(frankenphp_send_task) {
   /* the task is queued from here on: a bailout (memory limit) must not
    * leave the sender's side open, the receiver would wait on it forever */
   php_stream *stream = NULL;
-  zend_try {
-    frankenphp_task_sender_data *data = ecalloc(1, sizeof(*data));
-    data->sock.is_blocked = 1;
-    /* frankenphp_read_task() waits for the next update without the
-     * default_socket_timeout wake-ups; stream_select() bounds the wait */
-    data->sock.timeout.tv_sec = -1;
-    data->sock.socket = (php_socket_t)task.r1;
-    data->task = (uintptr_t)task.r0;
-    stream = php_stream_alloc(&frankenphp_task_sender_ops, data, NULL, "r");
-  }
+  zend_try { stream = frankenphp_task_stream_open(task.r0, task.r1, true); }
   zend_catch {
     go_frankenphp_task_cancel(task.r0, false);
     go_frankenphp_task_sender_close(task.r0);
-    frankenphp_close_sock(task.r1);
     zend_bailout();
   }
   zend_end_try();
 
-  /* wait for the pickup in the kernel: the thread taking the task writes a
-   * byte on the other end of the pair, the Go side does when the wait must
-   * end without a pickup, see go_frankenphp_send_task */
-  php_socket_t sock = (php_socket_t)task.r1;
-  int poll_timeout =
-      timeout_ms < 0 ? -1 : (timeout_ms > INT_MAX ? INT_MAX : (int)timeout_ms);
+  /* wait for the pickup in the kernel: the thread taking the task signals
+   * the sender's side, so does the Go side when the wait must end without a
+   * pickup, see go_frankenphp_send_task */
+  frankenphp_task_stream_data *data = stream->abstract;
   for (;;) {
-    int n = php_pollfd_for_ms(sock, PHP_POLLREADABLE, poll_timeout);
-    if (n < 0 && php_socket_errno() == EINTR) {
-      continue;
-    }
-    if (n <= 0) {
+    if (!frankenphp_task_stream_poll(data, timeout_ms)) {
       /* nobody took the task in time, unless right now */
       if (go_frankenphp_task_cancel(task.r0, true)) {
         php_stream_close(stream);
@@ -1504,24 +1629,27 @@ PHP_FUNCTION(frankenphp_send_task) {
                                 ZSTR_VAL(name));
         RETURN_THROWS();
       }
+      frankenphp_task_stream_consume(data);
 
       break;
     }
 
-    char byte;
-    (void)recv(sock, &byte, 1, 0);
     struct go_frankenphp_task_await_return state =
         go_frankenphp_task_await(task.r0);
+    if (state.r0 == 0) {
+      /* a signal ahead of its event, or a stale one */
+      frankenphp_task_chan_consume(data->fd);
+      continue;
+    }
+    frankenphp_task_stream_consume(data);
     if (state.r0 == 1) {
       break;
     }
-    if (state.r0 == 2) {
-      go_frankenphp_task_cancel(task.r0, false);
-      php_stream_close(stream);
-      zend_throw_exception(spl_ce_RuntimeException, state.r1, 0);
-      free(state.r1);
-      RETURN_THROWS();
-    }
+    go_frankenphp_task_cancel(task.r0, false);
+    php_stream_close(stream);
+    zend_throw_exception(spl_ce_RuntimeException, state.r1, 0);
+    free(state.r1);
+    RETURN_THROWS();
   }
 
   php_stream_to_zval(stream, return_value);
@@ -1540,24 +1668,14 @@ PHP_FUNCTION(frankenphp_read_task) {
         1, "must be a stream returned by frankenphp_send_task()");
     RETURN_THROWS();
   }
-  uintptr_t task = ((frankenphp_task_sender_data *)stream->abstract)->task;
+  frankenphp_task_stream_data *data = stream->abstract;
 
   for (;;) {
-    /* one byte per update, EOF once the receiver closed its stream */
-    char byte;
-    ssize_t n = php_stream_read(stream, &byte, 1);
-    if (n <= 0 && !stream->eof) {
-      /* the script set a read timeout on the stream */
-      zend_throw_exception(
-          spl_ce_RuntimeException,
-          "frankenphp_read_task(): timed out waiting for the next update", 0);
-      RETURN_THROWS();
-    }
-
     struct go_frankenphp_read_task_return update =
-        go_frankenphp_read_task(task);
+        go_frankenphp_read_task(data->task);
     switch (update.r1) {
     case FRANKENPHP_TASK_READ_UPDATE:
+      frankenphp_task_stream_consume(data);
       zend_try { frankenphp_vars_to_request(return_value, update.r0); }
       zend_catch {
         frankenphp_vars_free(update.r0);
@@ -1567,17 +1685,29 @@ PHP_FUNCTION(frankenphp_read_task) {
       frankenphp_vars_free(update.r0);
       return;
     case FRANKENPHP_TASK_READ_COMPLETED:
-      RETURN_NULL();
     case FRANKENPHP_TASK_READ_ABORTED:
+      if (!data->settled) {
+        data->settled = true;
+        frankenphp_task_stream_consume(data);
+        stream->eof = 1;
+      }
+      if (update.r1 == FRANKENPHP_TASK_READ_COMPLETED) {
+        RETURN_NULL();
+      }
       zend_throw_exception(spl_ce_RuntimeException,
                            "frankenphp_read_task(): the background worker "
                            "exited without completing the task",
                            0);
       RETURN_THROWS();
     default:
-      /* no update behind that byte: read on, or give up at EOF */
-      if (n <= 0) {
-        RETURN_NULL();
+      /* nothing yet: wait for the next signal, without consuming it, the
+       * event it announces does */
+      if (!frankenphp_task_stream_poll(data, data->timeout_ms)) {
+        data->timed_out = true;
+        zend_throw_exception(
+            spl_ce_RuntimeException,
+            "frankenphp_read_task(): timed out waiting for the next update", 0);
+        RETURN_THROWS();
       }
     }
   }
@@ -1608,18 +1738,12 @@ PHP_FUNCTION(frankenphp_receive_task) {
   zend_try {
     frankenphp_vars_to_request(&payload, task.r1);
     if (!EG(exception)) {
-      frankenphp_task_receiver_data *data = ecalloc(1, sizeof(*data));
-      data->sock.is_blocked = 1;
-      data->sock.timeout.tv_sec = -1;
-      data->sock.socket = (php_socket_t)task.r2;
-      data->task = (uintptr_t)task.r0;
-      stream = php_stream_alloc(&frankenphp_task_receiver_ops, data, NULL, "r");
+      stream = frankenphp_task_stream_open(task.r0, task.r2, false);
     }
   }
   zend_catch {
     frankenphp_vars_free(task.r1);
     go_frankenphp_task_receiver_close(task.r0, true);
-    frankenphp_close_sock(task.r2);
     zend_bailout();
   }
   zend_end_try();
@@ -1630,7 +1754,6 @@ PHP_FUNCTION(frankenphp_receive_task) {
      * processed, the sender is told so */
     zval_ptr_dtor(&payload);
     go_frankenphp_task_receiver_close(task.r0, true);
-    frankenphp_close_sock(task.r2);
     RETURN_THROWS();
   }
 
@@ -1667,7 +1790,7 @@ PHP_FUNCTION(frankenphp_update_task) {
 
   /* the Go side owns the update from here on, it frees it on failure */
   char *error = go_frankenphp_update_task(
-      ((frankenphp_task_receiver_data *)stream->abstract)->task,
+      ((frankenphp_task_stream_data *)stream->abstract)->task,
       Z_ARRVAL(persistent));
   if (error != NULL) {
     zend_throw_exception(spl_ce_RuntimeException, error, 0);
@@ -1739,15 +1862,6 @@ PHP_MINIT_FUNCTION(frankenphp) {
   frankenphp_worker_handle_ops.read = frankenphp_worker_handle_read;
   frankenphp_worker_handle_ops.cast = frankenphp_worker_handle_cast;
   frankenphp_worker_handle_ops.close = frankenphp_worker_handle_close;
-
-  frankenphp_task_sender_ops = php_stream_socket_ops;
-  frankenphp_task_sender_ops.label = "FrankenPHP task sender";
-  frankenphp_task_sender_ops.close = frankenphp_task_sender_close;
-
-  frankenphp_task_receiver_ops = php_stream_socket_ops;
-  frankenphp_task_receiver_ops.label = "FrankenPHP task receiver";
-  frankenphp_task_receiver_ops.write = frankenphp_task_receiver_write;
-  frankenphp_task_receiver_ops.close = frankenphp_task_receiver_close;
 
   register_frankenphp_symbols(module_number);
 #ifndef PHP_WIN32

@@ -205,8 +205,10 @@ void frankenphp_release_thread_for_kill(force_kill_slot slot);
 intptr_t frankenphp_set_background_worker_and_get_stop_sock(void);
 void frankenphp_close_sock(intptr_t s);
 void frankenphp_worker_signal_task(intptr_t s);
-int frankenphp_task_open_sock_pair(intptr_t socks[2]);
-void frankenphp_task_nudge(intptr_t s);
+int frankenphp_task_chan_open(intptr_t fds[2]);
+void frankenphp_task_chan_signal(intptr_t fd0, intptr_t fd1, int side);
+bool frankenphp_task_chan_consume(intptr_t fd);
+void frankenphp_task_chan_drain(intptr_t fd);
 void frankenphp_vars_to_request(zval *return_value, HashTable *table);
 void frankenphp_vars_free(HashTable *table);
 
