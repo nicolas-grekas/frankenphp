@@ -44,13 +44,18 @@ type workerTask struct {
 	// pair goes back to the pool
 	fds [2]int64
 
-	mu         sync.Mutex
-	cond       *sync.Cond // signaled on pop and close
-	updates    []*C.HashTable
-	closed     bool // the receiver closed its stream
-	aborted    bool // ...during request shutdown: the script ended with the task open
-	senderGone bool // the sender closed its stream
-	retired    int  // sides done with the task, freed at 2
+	mu   sync.Mutex
+	cond *sync.Cond // signaled on pop and close
+	// one wake-up per sleep of the sender's reads: a signal goes out only
+	// while the sender sleeps on its descriptor and none is outstanding, the
+	// sender consumes it on its next event and finds the rest in updates
+	// and the flags below
+	senderParked, senderSignaled bool
+	updates                      []*C.HashTable
+	closed                       bool // the receiver closed its stream
+	aborted                      bool // ...during request shutdown: the script ended with the task open
+	senderGone                   bool // the sender closed its stream
+	retired                      int  // sides done with the task, freed at 2
 }
 
 // taskQueue holds the tasks sent to a background worker until a thread picks
@@ -205,6 +210,19 @@ func freeTaskChans() {
 // the task or an abort
 func (t *workerTask) signalSender() {
 	C.frankenphp_task_chan_signal(C.intptr_t(t.fds[0]), C.intptr_t(t.fds[1]), 0)
+}
+
+// wakeSenderLocked tells whether an event calls for a signal: only when the
+// sender sleeps on its descriptor and none is outstanding. Called with mu
+// held, the caller signals after releasing it
+func (t *workerTask) wakeSenderLocked() bool {
+	if !t.senderParked || t.senderSignaled {
+		return false
+	}
+	t.senderSignaled = true
+	t.senderParked = false
+
+	return true
 }
 
 // signalReceiver wakes the receiver's stream_select(): the sender is gone
@@ -484,37 +502,74 @@ func go_frankenphp_update_task(handle C.uintptr_t, update *C.HashTable) *C.char 
 		return C.CString("frankenphp_update_task(): the sender closed the task")
 	}
 	t.updates = append(t.updates, update)
+	signal := t.wakeSenderLocked()
 	t.mu.Unlock()
 
-	// one signal per update, after the push: the sender consumes one per
-	// update it reads
-	t.signalSender()
+	if signal {
+		t.signalSender()
+	}
 
 	return nil
 }
 
+// go_frankenphp_read_task hands the sender its next event, and whether a
+// signal is outstanding on its descriptor for it to consume; with nothing to
+// hand, the sender parks and the next event signals it
+//
 //export go_frankenphp_read_task
-func go_frankenphp_read_task(handle C.uintptr_t) (*C.HashTable, C.int) {
+func go_frankenphp_read_task(handle C.uintptr_t) (*C.HashTable, C.int, C.bool) {
 	t := cgo.Handle(handle).Value().(*workerTask)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	consume := C.bool(t.senderSignaled)
 	if len(t.updates) > 0 {
 		update := t.updates[0]
 		t.updates = slices.Delete(t.updates, 0, 1)
 		t.cond.Signal()
+		t.senderSignaled, t.senderParked = false, false
 
-		return update, C.int(C.FRANKENPHP_TASK_READ_UPDATE)
+		return update, C.int(C.FRANKENPHP_TASK_READ_UPDATE), consume
 	}
 	switch {
 	case t.aborted:
-		return nil, C.int(C.FRANKENPHP_TASK_READ_ABORTED)
-	case t.closed:
-		return nil, C.int(C.FRANKENPHP_TASK_READ_COMPLETED)
-	}
+		t.senderSignaled, t.senderParked = false, false
 
-	return nil, C.int(C.FRANKENPHP_TASK_READ_PENDING)
+		return nil, C.int(C.FRANKENPHP_TASK_READ_ABORTED), consume
+	case t.closed:
+		t.senderSignaled, t.senderParked = false, false
+
+		return nil, C.int(C.FRANKENPHP_TASK_READ_COMPLETED), consume
+	}
+	t.senderParked = true
+
+	return nil, C.int(C.FRANKENPHP_TASK_READ_PENDING), false
+}
+
+// go_frankenphp_task_sender_wait is called when the sender casts its stream
+// for a select: it parks, unless an event is already there, in which case
+// a signal makes the select return at once
+//
+//export go_frankenphp_task_sender_wait
+func go_frankenphp_task_sender_wait(handle C.uintptr_t) {
+	t := cgo.Handle(handle).Value().(*workerTask)
+
+	t.mu.Lock()
+	signal := false
+	if len(t.updates) > 0 || t.closed {
+		if !t.senderSignaled {
+			t.senderSignaled = true
+			signal = true
+		}
+	} else {
+		t.senderParked = true
+	}
+	t.mu.Unlock()
+
+	if signal {
+		t.signalSender()
+	}
 }
 
 //export go_frankenphp_task_receiver_close
@@ -526,11 +581,11 @@ func go_frankenphp_task_receiver_close(handle C.uintptr_t, aborted C.bool) {
 	t.aborted = bool(aborted)
 	// the first side to close settles the outcome
 	settled := !t.senderGone
+	signal := t.wakeSenderLocked()
 	t.cond.Broadcast()
 	t.mu.Unlock()
-	// the sender finds the end of the task behind the updates still queued;
-	// nobody waits on its descriptor once it closed
-	if settled {
+	// the sender finds the end of the task behind the updates still queued
+	if signal {
 		t.signalSender()
 	}
 
@@ -558,6 +613,7 @@ func go_frankenphp_task_sender_close(handle C.uintptr_t) {
 
 	t.mu.Lock()
 	t.senderGone = true
+	t.senderParked = false
 	// the first side to close settles the outcome
 	settled := !t.closed
 	updates := t.updates

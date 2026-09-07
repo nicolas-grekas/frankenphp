@@ -1449,7 +1449,6 @@ typedef struct {
   int timeout_ms; /* stream_set_timeout(), -1 waits forever */
   bool sender;
   bool timed_out;
-  bool settled; /* the end of the task was reported, its signal consumed */
 } frankenphp_task_stream_data;
 
 static ssize_t frankenphp_task_stream_write(php_stream *stream, const char *buf,
@@ -1497,8 +1496,12 @@ static int frankenphp_task_stream_cast(php_stream *stream, int castas,
   if (castas != PHP_STREAM_AS_FD_FOR_SELECT) {
     return FAILURE;
   }
+  frankenphp_task_stream_data *data = stream->abstract;
+  if (data->sender) {
+    /* the sender parks for the select, unless an event is already there */
+    go_frankenphp_task_sender_wait(data->task);
+  }
   if (ret != NULL) {
-    frankenphp_task_stream_data *data = stream->abstract;
     *(php_socket_t *)ret = (php_socket_t)data->fd;
   }
 
@@ -1720,7 +1723,9 @@ PHP_FUNCTION(frankenphp_read_task) {
         go_frankenphp_read_task(data->task);
     switch (update.r1) {
     case FRANKENPHP_TASK_READ_UPDATE:
-      frankenphp_task_stream_consume(data);
+      if (update.r2) {
+        frankenphp_task_stream_consume(data);
+      }
       zend_try { frankenphp_vars_to_request(return_value, update.r0); }
       zend_catch {
         frankenphp_vars_free(update.r0);
@@ -1731,11 +1736,10 @@ PHP_FUNCTION(frankenphp_read_task) {
       return;
     case FRANKENPHP_TASK_READ_COMPLETED:
     case FRANKENPHP_TASK_READ_ABORTED:
-      if (!data->settled) {
-        data->settled = true;
+      if (update.r2) {
         frankenphp_task_stream_consume(data);
-        stream->eof = 1;
       }
+      stream->eof = 1;
       if (update.r1 == FRANKENPHP_TASK_READ_COMPLETED) {
         RETURN_NULL();
       }
