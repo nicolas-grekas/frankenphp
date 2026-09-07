@@ -21,6 +21,7 @@ type taskBenchResult struct {
 	PerTaskNs int `json:"per_task_ns"`
 	SendNs    int `json:"send_ns"`
 	ReadNs    int `json:"read_ns"`
+	CgoCallNs int `json:"cgo_call_ns"`
 	Worker    *struct {
 		Tasks        int `json:"tasks"`
 		Wakeups      int `json:"wakeups"`
@@ -28,6 +29,8 @@ type taskBenchResult struct {
 		ReceiveNs    int `json:"receive_ns"`
 		UpdateNs     int `json:"update_ns"`
 		CloseNs      int `json:"close_ns"`
+		WakeNs       int `json:"wake_ns"`
+		PickupNs     int `json:"pickup_ns"`
 	} `json:"worker"`
 }
 
@@ -90,7 +93,10 @@ func BenchmarkTask(b *testing.B) {
 			b.StopTimer()
 			b.ReportMetric(float64(r.SendNs), "send-ns/task")
 			b.ReportMetric(float64(r.ReadNs), "read-ns/task")
+			b.ReportMetric(float64(r.CgoCallNs), "cgo-call-ns")
 			if r.Worker != nil {
+				b.ReportMetric(float64(r.Worker.WakeNs), "worker-wake-ns/task")
+				b.ReportMetric(float64(r.Worker.PickupNs), "pickup-ns/task")
 				b.ReportMetric(float64(r.Worker.ReceiveNs), "receive-ns/task")
 				b.ReportMetric(float64(r.Worker.UpdateNs), "update-ns/task")
 				b.ReportMetric(float64(r.Worker.CloseNs), "close-ns/task")

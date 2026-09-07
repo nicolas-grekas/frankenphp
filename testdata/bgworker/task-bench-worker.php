@@ -8,7 +8,7 @@
 set_time_limit(0);
 $handle = frankenphp_get_worker_handle();
 $tasks = $wakeups = $emptyWakeups = 0;
-$receive = $update = $close = 0.0;
+$receive = $update = $close = $wake = $pickup = 0.0;
 while (false !== fgets($handle)) {
     ++$wakeups;
     $t0 = hrtime(true);
@@ -21,6 +21,13 @@ while (false !== fgets($handle)) {
         $t1 = hrtime(true);
         $receive += $t1 - $t0;
         [$stream, $payload] = $task;
+        // hrtime() is CLOCK_MONOTONIC, comparable across threads: the sender
+        // stamps the payload, so the wait for the pickup splits into our
+        // wake-up and the dequeue
+        if (isset($payload['sent_at'])) {
+            $wake += $t0 - $payload['sent_at'];
+            $pickup += $t1 - $payload['sent_at'];
+        }
         for ($i = 1, $updates = $payload['updates'] ?? 1; $i < $updates; ++$i) {
             frankenphp_update_task($stream, ['i' => $i]);
         }
@@ -39,6 +46,8 @@ while (false !== fgets($handle)) {
                 'receive_ns' => (int) ($receive / $tasks),
                 'update_ns' => (int) ($update / $tasks),
                 'close_ns' => (int) ($close / $tasks),
+                'wake_ns' => (int) ($wake / $tasks),
+                'pickup_ns' => (int) ($pickup / $tasks),
             ]);
         }
         $t0 = hrtime(true);
