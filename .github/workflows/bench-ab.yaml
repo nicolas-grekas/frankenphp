@@ -1,0 +1,59 @@
+---
+name: Bench A/B
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        description: ref A
+        default: bgworker-tasks
+      b:
+        description: ref B
+        default: bgworker-tasks-lazy
+      rounds:
+        description: rounds
+        default: "4"
+  push:
+    branches:
+      - bench-ab
+permissions:
+  contents: read
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: "-tags=nobadger,nomysql,nopgx,nowatcher"
+jobs:
+  ab:
+    name: A/B ${{ inputs.a || 'bgworker-tasks' }} vs ${{ inputs.b || 'bgworker-tasks-lazy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.a || 'bgworker-tasks' }}
+          path: side-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.b || 'bgworker-tasks-lazy' }}
+          path: side-b
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+        with:
+          working-directory: side-a
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: "8.5"
+          ini-file: development
+          coverage: none
+          tools: none
+        env:
+          phpts: ts
+      - name: Install strace
+        run: sudo apt-get install -y strace
+      - name: Set CGO flags
+        run: echo "CGO_CFLAGS=-DFRANKENPHP_TEST $(php-config --includes)" >> "${GITHUB_ENV}"
+      - name: Machine
+        run: nproc; lscpu | grep -E 'Model name|Hypervisor' || true
+      - name: A/B
+        run: bench/ab.sh "$PWD/side-a" "$PWD/side-b" "${{ inputs.rounds || '4' }}"
