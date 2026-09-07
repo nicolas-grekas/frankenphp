@@ -14,11 +14,6 @@ import (
 // frankenphp_update_task() waits for the sender to read
 const taskUpdatesMax = 16
 
-// taskSignalEscalation bounds how long a task waits on the one thread it was
-// signaled to: past it every thread gets the line, so a script that parked
-// its handle without reading it does not hold the task
-const taskSignalEscalation = 10 * time.Millisecond
-
 // workerTask is a unit of work handed by a PHP thread to a thread of a
 // background worker, see frankenphp_send_task(). The payload and the
 // updates flowing back are persistent HashTables, copied into request
@@ -32,9 +27,12 @@ type workerTask struct {
 	pickedUp chan struct{} // closed when a thread picks the task up
 	// cancelled is closed when the sender gave up before any pickup, ending
 	// the watcher; abortReason is set by the watcher, under the queue mutex,
-	// when the wait must end without a pickup
-	cancelled   chan struct{}
-	abortReason string
+	// when the wait must end without a pickup; drainChan and shutdown are
+	// the channels the watcher ends the wait on, read on the sender's thread
+	// at send time
+	cancelled           chan struct{}
+	abortReason         string
+	drainChan, shutdown <-chan struct{}
 	// receiver and pickedUpAt are set by the thread that picked the task
 	// up and read by its close, on the same thread
 	receiver   *backgroundWorkerThread
@@ -102,7 +100,7 @@ func (worker *worker) claimParkedThread() (*backgroundWorkerThread, int64) {
 	return nil, -1
 }
 
-// claimAllThreads is the fallback of taskSignalEscalation: every thread of
+// claimAllThreads is the fallback of go_frankenphp_task_linger: every thread of
 // the worker gets the line, parked or not. Called with tasks.mu held, the
 // caller writes to the sockets after releasing it
 func (worker *worker) claimAllThreads() (handlers []*backgroundWorkerThread, socks []int64) {
@@ -244,10 +242,6 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 
 		return 0, -1, C.CString("frankenphp_send_task(): background worker " + strconv.Quote(workerName) + " has a single thread and cannot send a task to itself")
 	}
-	// closed when this thread is drained for a restart or the shutdown: the
-	// target's threads are drained too, nobody would pick the task up
-	drainChan := thread.drainChan
-
 	fds, ok := taskChanGet()
 	if !ok {
 		C.frankenphp_vars_free(payload)
@@ -261,6 +255,12 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		pickedUp:  make(chan struct{}),
 		cancelled: make(chan struct{}),
 		fds:       fds,
+		// closed when this thread is drained for a restart or the shutdown:
+		// the target's threads are drained too, nobody would pick the task
+		// up. Read here, on the PHP thread: a goroutine may only get to run
+		// after Shutdown() replaced them
+		drainChan: thread.drainChan,
+		shutdown:  mainThread.done,
 	}
 	t.cond = sync.NewCond(&t.mu)
 	t.handle = cgo.NewHandle(t)
@@ -279,46 +279,48 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	// the C side waits for the pickup on the sender's descriptor, in the
 	// kernel rather than in a Go select: waking a thread parked inside a Go
 	// callback costs the scheduler a hand-off, a signal on a descriptor does
-	// not. The thread taking the task sends it, the watcher does when the
-	// wait must end without a pickup. The shutdown channel is read here, on
-	// the PHP thread: the goroutine may only get to run after Shutdown()
-	go t.watch(drainChan, mainThread.done)
+	// not. The thread taking the task sends it; a pickup that takes longer
+	// than the first wait slice brings in go_frankenphp_task_linger
 
 	return C.uintptr_t(t.handle), C.intptr_t(t.fds[0]), nil
 }
 
-// watch escalates the wake-up when the thread signaled first does not come
-// and ends the sender's wait when its thread is drained or FrankenPHP shuts
-// down; it returns once the task is picked up or the sender gave up
-func (t *workerTask) watch(drainChan, shutdown <-chan struct{}) {
-	escalate := time.NewTimer(taskSignalEscalation)
-	defer escalate.Stop()
+// go_frankenphp_task_linger is called by a sender whose first wait slice
+// passed without a pickup, the uncommon case: the thread signaled first did
+// not come, so every thread gets the line, and a watcher starts to end the
+// wait if the sender's thread is drained or FrankenPHP shuts down. Neither
+// costs the common case, a pickup within microseconds, a goroutine
+//
+//export go_frankenphp_task_linger
+func go_frankenphp_task_linger(handle C.uintptr_t) {
+	t := cgo.Handle(handle).Value().(*workerTask)
 
-	for {
-		select {
-		case <-t.pickedUp:
-			return
-		case <-t.cancelled:
-			return
-		case <-escalate.C:
-			q := &t.worker.tasks
-			q.mu.Lock()
-			var handlers []*backgroundWorkerThread
-			var socks []int64
-			if slices.Contains(q.pending, t) {
-				handlers, socks = t.worker.claimAllThreads()
-			}
-			q.mu.Unlock()
-			signalThreads(handlers, socks)
-		case <-drainChan:
-			t.abort("frankenphp_send_task(): the calling thread is restarting or shutting down")
+	q := &t.worker.tasks
+	q.mu.Lock()
+	var handlers []*backgroundWorkerThread
+	var socks []int64
+	pending := slices.Contains(q.pending, t)
+	if pending {
+		handlers, socks = t.worker.claimAllThreads()
+	}
+	q.mu.Unlock()
+	signalThreads(handlers, socks)
 
-			return
-		case <-shutdown:
-			t.abort("frankenphp_send_task(): FrankenPHP is shutting down")
+	if pending {
+		go t.watch()
+	}
+}
 
-			return
-		}
+// watch ends the sender's wait when its thread is drained or FrankenPHP
+// shuts down; it returns once the task is picked up or the sender gave up
+func (t *workerTask) watch() {
+	select {
+	case <-t.pickedUp:
+	case <-t.cancelled:
+	case <-t.drainChan:
+		t.abort("frankenphp_send_task(): the calling thread is restarting or shutting down")
+	case <-t.shutdown:
+		t.abort("frankenphp_send_task(): FrankenPHP is shutting down")
 	}
 }
 
