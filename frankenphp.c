@@ -1596,9 +1596,9 @@ PHP_FUNCTION(frankenphp_send_task) {
   struct go_frankenphp_send_task_return task =
       go_frankenphp_send_task(frankenphp_thread_index(), ZSTR_VAL(name),
                               ZSTR_LEN(name), Z_ARRVAL(persistent));
-  if (task.r2 != NULL) {
-    zend_throw_exception(spl_ce_RuntimeException, task.r2, 0);
-    free(task.r2);
+  if (task.r3 != NULL) {
+    zend_throw_exception(spl_ce_RuntimeException, task.r3, 0);
+    free(task.r3);
     RETURN_THROWS();
   }
 
@@ -1634,21 +1634,25 @@ PHP_FUNCTION(frankenphp_send_task) {
       break;
     }
 
-    struct go_frankenphp_task_await_return state =
-        go_frankenphp_task_await(task.r0);
-    if (state.r0 == 0) {
+    int32_t state = __atomic_load_n(task.r2, __ATOMIC_ACQUIRE);
+    if (state == FRANKENPHP_TASK_PENDING) {
       /* a signal ahead of its event, or a stale one */
       frankenphp_task_chan_consume(data->fd);
       continue;
     }
     frankenphp_task_stream_consume(data);
-    if (state.r0 == 1) {
+    if (state == FRANKENPHP_TASK_PICKED_UP) {
       break;
     }
     go_frankenphp_task_cancel(task.r0, false);
     php_stream_close(stream);
-    zend_throw_exception(spl_ce_RuntimeException, state.r1, 0);
-    free(state.r1);
+    zend_throw_exception(spl_ce_RuntimeException,
+                         state == FRANKENPHP_TASK_ABORTED_DRAIN
+                             ? "frankenphp_send_task(): the calling thread "
+                               "is restarting or shutting down"
+                             : "frankenphp_send_task(): FrankenPHP is "
+                               "shutting down",
+                         0);
     RETURN_THROWS();
   }
 

@@ -7,7 +7,9 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // taskUpdatesMax bounds the updates buffered per task: past it,
@@ -31,10 +33,11 @@ type workerTask struct {
 	payload  *C.HashTable  // owned by the task until a thread picks it up
 	pickedUp chan struct{} // closed when a thread picks the task up
 	// cancelled is closed when the sender gave up before any pickup, ending
-	// the watcher; abortReason is set by the watcher, under the queue mutex,
-	// when the wait must end without a pickup
-	cancelled   chan struct{}
-	abortReason string
+	// the watcher
+	cancelled chan struct{}
+	// state is a FRANKENPHP_TASK_* word in C memory, written here before the
+	// sender is signaled and read by its wait loop, in C, without a callback
+	state *C.int32_t
 	// receiver and pickedUpAt are set by the thread that picked the task
 	// up and read by its close, on the same thread
 	receiver   *backgroundWorkerThread
@@ -226,23 +229,29 @@ func (t *workerTask) free() {
 		C.frankenphp_vars_free(update)
 	}
 	taskChanPut(t.fds)
+	C.free(unsafe.Pointer(t.state))
 	t.handle.Delete()
 }
 
+// setState publishes where the task stands to the sender's wait loop
+func (t *workerTask) setState(state int32) {
+	atomic.StoreInt32((*int32)(unsafe.Pointer(t.state)), state)
+}
+
 //export go_frankenphp_send_task
-func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.size_t, payload *C.HashTable) (C.uintptr_t, C.intptr_t, *C.char) {
+func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.size_t, payload *C.HashTable) (C.uintptr_t, C.intptr_t, *C.int32_t, *C.char) {
 	thread := phpThreads[threadIndex]
 	workerName := C.GoStringN(name, C.int(nameLen))
 	w := backgroundWorkerByName(thread.handler.frankenPHPContext(), workerName)
 	if w == nil {
 		C.frankenphp_vars_free(payload)
 
-		return 0, -1, C.CString("frankenphp_send_task(): unknown background worker " + strconv.Quote(workerName))
+		return 0, -1, nil, C.CString("frankenphp_send_task(): unknown background worker " + strconv.Quote(workerName))
 	}
 	if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.worker == w && w.countThreads() == 1 {
 		C.frankenphp_vars_free(payload)
 
-		return 0, -1, C.CString("frankenphp_send_task(): background worker " + strconv.Quote(workerName) + " has a single thread and cannot send a task to itself")
+		return 0, -1, nil, C.CString("frankenphp_send_task(): background worker " + strconv.Quote(workerName) + " has a single thread and cannot send a task to itself")
 	}
 	// closed when this thread is drained for a restart or the shutdown: the
 	// target's threads are drained too, nobody would pick the task up
@@ -252,7 +261,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	if !ok {
 		C.frankenphp_vars_free(payload)
 
-		return 0, -1, C.CString("frankenphp_send_task(): failed to create the channel of the task")
+		return 0, -1, nil, C.CString("frankenphp_send_task(): failed to create the channel of the task")
 	}
 
 	t := &workerTask{
@@ -261,6 +270,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		pickedUp:  make(chan struct{}),
 		cancelled: make(chan struct{}),
 		fds:       fds,
+		state:     (*C.int32_t)(C.calloc(1, C.size_t(unsafe.Sizeof(C.int32_t(0))))),
 	}
 	t.cond = sync.NewCond(&t.mu)
 	t.handle = cgo.NewHandle(t)
@@ -284,7 +294,7 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	// the PHP thread: the goroutine may only get to run after Shutdown()
 	go t.watch(drainChan, mainThread.done)
 
-	return C.uintptr_t(t.handle), C.intptr_t(t.fds[0]), nil
+	return C.uintptr_t(t.handle), C.intptr_t(t.fds[0]), t.state, nil
 }
 
 // watch escalates the wake-up when the thread signaled first does not come
@@ -311,11 +321,11 @@ func (t *workerTask) watch(drainChan, shutdown <-chan struct{}) {
 			q.mu.Unlock()
 			signalThreads(handlers, socks)
 		case <-drainChan:
-			t.abort("frankenphp_send_task(): the calling thread is restarting or shutting down")
+			t.abort(C.FRANKENPHP_TASK_ABORTED_DRAIN)
 
 			return
 		case <-shutdown:
-			t.abort("frankenphp_send_task(): FrankenPHP is shutting down")
+			t.abort(C.FRANKENPHP_TASK_ABORTED_SHUTDOWN)
 
 			return
 		}
@@ -323,11 +333,11 @@ func (t *workerTask) watch(drainChan, shutdown <-chan struct{}) {
 }
 
 // abort ends the sender's wait for a pickup that must not happen anymore
-func (t *workerTask) abort(reason string) {
+func (t *workerTask) abort(state int32) {
 	q := &t.worker.tasks
 	q.mu.Lock()
 	if slices.Contains(q.pending, t) {
-		t.abortReason = reason
+		t.setState(state)
 		t.signalSender()
 	}
 	q.mu.Unlock()
@@ -347,30 +357,6 @@ func go_frankenphp_task_side_gone(handle C.uintptr_t, sender C.bool) C.bool {
 	}
 
 	return C.bool(t.senderGone)
-}
-
-// go_frankenphp_task_await tells the sender, woken on its socket, where its
-// task stands: 1 picked up, 2 aborted with the reason, 0 neither
-//
-//export go_frankenphp_task_await
-func go_frankenphp_task_await(handle C.uintptr_t) (C.int, *C.char) {
-	t := cgo.Handle(handle).Value().(*workerTask)
-
-	select {
-	case <-t.pickedUp:
-		return 1, nil
-	default:
-	}
-
-	q := &t.worker.tasks
-	q.mu.Lock()
-	reason := t.abortReason
-	q.mu.Unlock()
-	if reason != "" {
-		return 2, C.CString(reason)
-	}
-
-	return 0, nil
 }
 
 // go_frankenphp_task_cancel takes a task nobody picked up out of the queue
@@ -458,7 +444,8 @@ func go_frankenphp_receive_task(threadIndex C.uintptr_t) (C.uintptr_t, *C.HashTa
 	metrics.DequeuedWorkerRequest(handler.worker.qualifiedName)
 	close(t.pickedUp)
 	// wakes the sender's wait for the pickup, see go_frankenphp_send_task;
-	// after the channel, so the sender finds it closed once woken
+	// after the state, so the sender finds it once woken
+	t.setState(C.FRANKENPHP_TASK_PICKED_UP)
 	t.signalSender()
 
 	t.receiver = handler

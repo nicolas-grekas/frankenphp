@@ -212,6 +212,15 @@ void frankenphp_task_chan_drain(intptr_t fd);
 void frankenphp_vars_to_request(zval *return_value, HashTable *table);
 void frankenphp_vars_free(HashTable *table);
 
+/* Where a task stands for the sender waiting for its pickup: a word the Go
+ * side writes before signaling, so the sender reads it without a callback. */
+enum {
+  FRANKENPHP_TASK_PENDING,
+  FRANKENPHP_TASK_PICKED_UP,
+  FRANKENPHP_TASK_ABORTED_DRAIN,
+  FRANKENPHP_TASK_ABORTED_SHUTDOWN,
+};
+
 /* Results of go_frankenphp_read_task. */
 enum {
   FRANKENPHP_TASK_READ_UPDATE,
