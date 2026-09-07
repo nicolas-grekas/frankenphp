@@ -49,6 +49,11 @@ type backgroundWorkerThread struct {
 	// for a Windows SOCKET, -1 when not held. Guarded by worker.tasks.mu:
 	// frankenphp_send_task() writes its wake-up line to it.
 	stopSock int64
+
+	// parked is set while the script blocks reading its handle, or cast it
+	// for a select, and no task is queued: senders wake one parked thread
+	// per task. Guarded by worker.tasks.mu.
+	parked bool
 }
 
 // backgroundBootWarnDelay is how long a run may go without waiting on its
@@ -84,6 +89,7 @@ func (handler *backgroundWorkerThread) drain() {
 	q.mu.Lock()
 	s := handler.stopSock
 	handler.stopSock = -1
+	handler.parked = false
 	q.mu.Unlock()
 
 	if s >= 0 {
@@ -155,13 +161,11 @@ func (handler *backgroundWorkerThread) setupScript() error {
 	if s < 0 {
 		return fmt.Errorf("failed to create the stop socket pair of background worker %q", handler.worker.qualifiedName)
 	}
+	// tasks queued meanwhile reach the new run when it parks, see
+	// go_frankenphp_background_worker_wait
 	q := &handler.worker.tasks
 	q.mu.Lock()
 	handler.stopSock = s
-	// tasks sent between two runs were signaled on the previous pair
-	for range q.pending {
-		C.frankenphp_worker_signal_task(C.intptr_t(s))
-	}
 	q.mu.Unlock()
 
 	switch handler.state.Get() {

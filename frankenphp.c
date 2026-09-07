@@ -1226,13 +1226,28 @@ static ssize_t frankenphp_worker_handle_read(php_stream *stream, char *buf,
                                              size_t count) {
   frankenphp_worker_handle_waited();
 
-  return php_stream_socket_ops.read(stream, buf, count);
+  /* park, unless tasks are queued: then the line comes from here, without a
+   * round trip through the socket */
+  uintptr_t idx = frankenphp_thread_index();
+  if (count >= sizeof("task\n") - 1 &&
+      go_frankenphp_background_worker_wait(idx, false)) {
+    memcpy(buf, "task\n", sizeof("task\n") - 1);
+
+    return sizeof("task\n") - 1;
+  }
+  ssize_t n = php_stream_socket_ops.read(stream, buf, count);
+  go_frankenphp_background_worker_woke(idx);
+
+  return n;
 }
 
 static int frankenphp_worker_handle_cast(php_stream *stream, int castas,
                                          void **ret) {
   if (castas == PHP_STREAM_AS_FD_FOR_SELECT) {
     frankenphp_worker_handle_waited();
+    /* park for the select; tasks queued meanwhile land as a line on the
+     * socket, so the select returns at once */
+    go_frankenphp_background_worker_wait(frankenphp_thread_index(), true);
   }
 
   return php_stream_socket_ops.cast(stream, castas, ret);

@@ -15,6 +15,11 @@ import (
 // frankenphp_update_task() waits for the sender to read
 const taskUpdatesMax = 16
 
+// taskSignalEscalation bounds how long a task waits on the one thread it was
+// signaled to: past it every thread gets the line, so a script that parked
+// its handle without reading it does not hold the task
+const taskSignalEscalation = 10 * time.Millisecond
+
 // workerTask is a unit of work handed by a PHP thread to a thread of a
 // background worker, see frankenphp_send_task(). The payload and the
 // updates flowing back are persistent HashTables, copied into request
@@ -54,6 +59,7 @@ type workerTask struct {
 type taskQueue struct {
 	mu      sync.Mutex
 	pending []*workerTask
+	next    int // thread to signal first, spreads tasks over a pool
 }
 
 // remove takes t out of the queue; false if a thread picked it up already
@@ -70,13 +76,37 @@ func (q *taskQueue) remove(t *workerTask) bool {
 	return true
 }
 
-// signalTask writes the wake-up line on the handle of every thread of the
-// worker, the first one back in its loop takes the task; called with
-// tasks.mu held
-func (worker *worker) signalTask() {
+// signalTask wakes one parked thread of the worker with the line its script
+// reads on the handle, round-robin over the pool; a thread claimed this way
+// is no longer parked. False when no thread is parked: the task then waits
+// in the queue for a thread to drain it or to park, see
+// go_frankenphp_background_worker_wait. Called with tasks.mu held
+func (worker *worker) signalTask() bool {
+	worker.threadMutex.RLock()
+	defer worker.threadMutex.RUnlock()
+
+	n := len(worker.threads)
+	for i := range n {
+		thread := worker.threads[(worker.tasks.next+i)%n]
+		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.parked && handler.stopSock >= 0 {
+			handler.parked = false
+			worker.tasks.next = (worker.tasks.next + i + 1) % n
+			C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// signalAllThreads is the fallback of taskSignalEscalation: every thread of
+// the worker gets the line, parked or not; called with tasks.mu held
+func (worker *worker) signalAllThreads() {
 	worker.threadMutex.RLock()
 	for _, thread := range worker.threads {
 		if handler, ok := thread.handler.(*backgroundWorkerThread); ok && handler.stopSock >= 0 {
+			handler.parked = false
 			C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
 		}
 	}
@@ -165,17 +195,34 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 		timeout = timer.C
 	}
 
+	escalate := time.NewTimer(taskSignalEscalation)
+	defer escalate.Stop()
+
 	var err error
 	timedOut := false
-	select {
-	case <-t.pickedUp:
-	case <-timeout:
-		err = errors.New("frankenphp_send_task(): no thread of background worker " + strconv.Quote(workerName) + " picked up the task in time")
-		timedOut = true
-	case <-drainChan:
-		err = errors.New("frankenphp_send_task(): the calling thread is restarting or shutting down")
-	case <-mainThread.done:
-		err = errors.New("frankenphp_send_task(): FrankenPHP is shutting down")
+wait:
+	for {
+		select {
+		case <-t.pickedUp:
+			break wait
+		case <-escalate.C:
+			// the thread signaled first did not come, wake them all
+			q.mu.Lock()
+			if slices.Contains(q.pending, t) {
+				w.signalAllThreads()
+			}
+			q.mu.Unlock()
+		case <-timeout:
+			err = errors.New("frankenphp_send_task(): no thread of background worker " + strconv.Quote(workerName) + " picked up the task in time")
+			timedOut = true
+			break wait
+		case <-drainChan:
+			err = errors.New("frankenphp_send_task(): the calling thread is restarting or shutting down")
+			break wait
+		case <-mainThread.done:
+			err = errors.New("frankenphp_send_task(): FrankenPHP is shutting down")
+			break wait
+		}
 	}
 	if err != nil && !q.remove(t) {
 		// picked up at the last moment
@@ -196,6 +243,52 @@ func go_frankenphp_send_task(threadIndex C.uintptr_t, name *C.char, nameLen C.si
 	t.socks[0] = -1
 
 	return C.uintptr_t(t.handle), C.intptr_t(s), nil
+}
+
+// go_frankenphp_background_worker_wait is called before a script blocks on
+// its handle, a read or a select cast: the thread parks unless tasks are
+// queued, in which case the script must dequeue them first. For a read the
+// line then comes from the read op itself; a select needs a real one on the
+// socket. Under tasks.mu, so a task queued after the check finds the thread
+// parked and signals it: no wake-up is lost either way.
+//
+//export go_frankenphp_background_worker_wait
+func go_frankenphp_background_worker_wait(threadIndex C.uintptr_t, forSelect C.bool) C.bool {
+	handler, ok := phpThreads[threadIndex].handler.(*backgroundWorkerThread)
+	if !ok {
+		return false
+	}
+
+	q := &handler.worker.tasks
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.pending) == 0 {
+		handler.parked = true
+
+		return false
+	}
+	if bool(forSelect) && handler.stopSock >= 0 {
+		C.frankenphp_worker_signal_task(C.intptr_t(handler.stopSock))
+	}
+
+	return true
+}
+
+// go_frankenphp_background_worker_woke is called once a read on the handle
+// returned: the script is running again
+//
+//export go_frankenphp_background_worker_woke
+func go_frankenphp_background_worker_woke(threadIndex C.uintptr_t) {
+	handler, ok := phpThreads[threadIndex].handler.(*backgroundWorkerThread)
+	if !ok {
+		return
+	}
+
+	q := &handler.worker.tasks
+	q.mu.Lock()
+	handler.parked = false
+	q.mu.Unlock()
 }
 
 //export go_frankenphp_receive_task
