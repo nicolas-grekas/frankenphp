@@ -8,7 +8,7 @@ on:
         default: bgworker-tasks
       b:
         description: ref B
-        default: bgworker-tasks-lazy
+        default: bgworker-tasks-perf
       rounds:
         description: rounds
         default: "4"
