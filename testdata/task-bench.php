@@ -19,11 +19,11 @@ $start = hrtime(true);
 for ($i = 0; $i < $n; ++$i) {
     $t0 = hrtime(true);
     $payload['sent_at'] = $t0;
-    $task = frankenphp_send_task($name, $payload);
+    $task = new \FrankenPHP\SentTaskHandle($name, $payload);
     $t1 = hrtime(true);
-    while (null !== frankenphp_read_task($task)) {
+    while (null !== $task->read()) {
     }
-    fclose($task);
+    unset($task);
     $t2 = hrtime(true);
     $send += $t1 - $t0;
     $read += $t2 - $t1;

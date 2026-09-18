@@ -28,7 +28,7 @@ type taskBenchResult struct {
 		EmptyWakeups int `json:"empty_wakeups"`
 		ReceiveNs    int `json:"receive_ns"`
 		UpdateNs     int `json:"update_ns"`
-		CloseNs      int `json:"close_ns"`
+		CompleteNs   int `json:"complete_ns"`
 		WakeNs       int `json:"wake_ns"`
 		PickupNs     int `json:"pickup_ns"`
 	} `json:"worker"`
@@ -99,7 +99,7 @@ func BenchmarkTask(b *testing.B) {
 				b.ReportMetric(float64(r.Worker.PickupNs), "pickup-ns/task")
 				b.ReportMetric(float64(r.Worker.ReceiveNs), "receive-ns/task")
 				b.ReportMetric(float64(r.Worker.UpdateNs), "update-ns/task")
-				b.ReportMetric(float64(r.Worker.CloseNs), "close-ns/task")
+				b.ReportMetric(float64(r.Worker.CompleteNs), "complete-ns/task")
 				b.ReportMetric(float64(r.Worker.EmptyWakeups)/float64(r.Worker.Tasks), "empty-wakeups/task")
 			}
 		})
