@@ -550,6 +550,10 @@ void frankenphp_worker_signal_task(intptr_t s) {
   frankenphp_sock_send((php_socket_t)s, "\n", 1);
 }
 
+/* The first slice of a sender's wait for a pickup, in ms; past it the Go
+ * side gets involved, see go_frankenphp_task_linger. */
+#define FRANKENPHP_TASK_LINGER_MS 10
+
 /* Task channels: one descriptor per side of a task, the sender's [0] and
  * the receiver's [1], each waited on by its stream and signaled by the other
  * side through the Go side. On Linux they are eventfds: a counter, no
@@ -1798,8 +1802,26 @@ ZEND_METHOD(FrankenPHP_SentTaskHandle, __construct) {
    * the sender's side, so does the Go side when the wait must end without a
    * pickup, see go_frankenphp_send_task */
   frankenphp_task_stream_data *data = stream->abstract;
+  /* the first slice of the wait is short: past it, the Go side escalates the
+   * wake-up and starts watching for a drain or the shutdown, neither of
+   * which the common case, a pickup within microseconds, needs */
+  int remaining = timeout_ms;
+  bool lingering = false;
   for (;;) {
-    if (!frankenphp_task_stream_poll(data, timeout_ms)) {
+    int slice = remaining;
+    if (!lingering &&
+        (remaining < 0 || remaining > FRANKENPHP_TASK_LINGER_MS)) {
+      slice = FRANKENPHP_TASK_LINGER_MS;
+    }
+    if (!frankenphp_task_stream_poll(data, slice)) {
+      if (remaining > 0) {
+        remaining -= slice;
+      }
+      if (!lingering && remaining != 0) {
+        lingering = true;
+        go_frankenphp_task_linger(task.r0);
+        continue;
+      }
       /* nobody took the task in time, unless right now */
       if (go_frankenphp_task_cancel(task.r0, true)) {
         php_stream_close(stream);
