@@ -19,6 +19,8 @@ To find the right values, it's best to run load tests simulating real traffic.
 [k6](https://k6.io) and [Gatling](https://gatling.io) are good tools for this.
 
 To configure the number of threads, use the `num_threads` option of the global `frankenphp` directive.
+
+`num_threads` is a total: the threads a worker starts are part of it, so raising a worker's `num` leaves fewer threads for the requests no worker serves. Use `num_regular_threads` instead to set that number directly and let the total follow, and `max_regular_threads` for its runtime limit. The two spellings cannot be combined.
 To change the number of workers, use the `num` option of the `worker` section of the `frankenphp` directive.
 
 ### `max_threads`

@@ -284,3 +284,35 @@ func TestCreateUniqueWorkerNamesQualifiedByServer(t *testing.T) {
 	// workers without a server keep the numeric postfix behavior
 	require.Equal(t, "queue_2", app.createUniqueWorkerName(wc, ""))
 }
+
+func TestAppRegularThreadDirectives(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+	{
+		frankenphp {
+			num_regular_threads 4
+			max_regular_threads auto
+		}
+	}`)
+	app := &FrankenPHPApp{}
+
+	require.NoError(t, app.UnmarshalCaddyfile(d))
+	require.Equal(t, 4, app.NumRegularThreads)
+	require.Equal(t, -1, app.MaxRegularThreads, "auto is reported as -1, like max_threads")
+	require.Zero(t, app.NumThreads, "the totals stay untouched, they are derived at startup")
+}
+
+func TestAppRegularThreadDirectivesRejectTheTotals(t *testing.T) {
+	for name, config := range map[string]string{
+		"num": `{ frankenphp { num_threads 8
+			num_regular_threads 4 } }`,
+		"max": `{ frankenphp { max_threads 8
+			max_regular_threads 4 } }`,
+		"max below num": `{ frankenphp { num_regular_threads 8
+			max_regular_threads 4 } }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			app := &FrankenPHPApp{}
+			require.Error(t, app.UnmarshalCaddyfile(caddyfile.NewTestDispenser(config)))
+		})
+	}
+}

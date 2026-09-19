@@ -49,6 +49,10 @@ type FrankenPHPApp struct {
 	NumThreads int `json:"num_threads,omitempty"`
 	// MaxThreads limits how many threads can be started at runtime. Default 2x NumThreads
 	MaxThreads int `json:"max_threads,omitempty"`
+	// NumRegularThreads sets the number of PHP threads to start for the requests no worker serves, worker threads coming on top of it
+	NumRegularThreads int `json:"num_regular_threads,omitempty"`
+	// MaxRegularThreads limits how many threads for regular requests can be started at runtime, the workers' own limits coming on top of it
+	MaxRegularThreads int `json:"max_regular_threads,omitempty"`
 	// Workers configures the worker scripts to start
 	Workers []workerConfig `json:"workers,omitempty"`
 	// Overwrites the default php ini configuration
@@ -123,6 +127,8 @@ func (f *FrankenPHPApp) Start() error {
 		frankenphp.WithLogger(f.logger),
 		frankenphp.WithNumThreads(f.NumThreads),
 		frankenphp.WithMaxThreads(f.MaxThreads),
+		frankenphp.WithNumRegularThreads(f.NumRegularThreads),
+		frankenphp.WithMaxRegularThreads(f.MaxRegularThreads),
 		frankenphp.WithMetrics(f.metrics),
 		frankenphp.WithPhpIni(f.PhpIni),
 		frankenphp.WithMaxWaitTime(f.MaxWaitTime),
@@ -284,6 +290,33 @@ func (f *FrankenPHPApp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 
 				f.NumThreads = int(v)
+			case "num_regular_threads":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				v, err := strconv.ParseUint(d.Val(), 10, 32)
+				if err != nil {
+					return err
+				}
+
+				f.NumRegularThreads = int(v)
+			case "max_regular_threads":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				if d.Val() == "auto" {
+					f.MaxRegularThreads = -1
+					continue
+				}
+
+				v, err := strconv.ParseUint(d.Val(), 10, 32)
+				if err != nil {
+					return err
+				}
+
+				f.MaxRegularThreads = int(v)
 			case "max_threads":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -390,13 +423,25 @@ func (f *FrankenPHPApp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 				f.Workers = append(f.Workers, wc)
 			default:
-				return wrongSubDirectiveError("frankenphp", "num_threads, max_threads, php_ini, worker, max_wait_time, max_idle_time, max_requests", d.Val())
+				return wrongSubDirectiveError("frankenphp", "num_threads, max_threads, num_regular_threads, max_regular_threads, php_ini, worker, max_wait_time, max_idle_time, max_requests", d.Val())
 			}
 		}
 	}
 
 	if f.MaxThreads > 0 && f.NumThreads > 0 && f.MaxThreads < f.NumThreads {
 		return d.Err(`"max_threads"" must be greater than or equal to "num_threads"`)
+	}
+
+	if f.NumRegularThreads > 0 && f.NumThreads > 0 {
+		return d.Err(`"num_threads" and "num_regular_threads" cannot be set together`)
+	}
+
+	if f.MaxRegularThreads != 0 && f.MaxThreads != 0 {
+		return d.Err(`"max_threads" and "max_regular_threads" cannot be set together`)
+	}
+
+	if f.MaxRegularThreads > 0 && f.NumRegularThreads > 0 && f.MaxRegularThreads < f.NumRegularThreads {
+		return d.Err(`"max_regular_threads" must be greater than or equal to "num_regular_threads"`)
 	}
 
 	return nil

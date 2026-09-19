@@ -368,6 +368,28 @@ func TestCorrectThreadCalculation(t *testing.T) {
 	testThreadCalculationError(t, &opt{workers: []workerOpt{{num: 3, maxThreads: 2}}})
 }
 
+// the regular forms state the threads left for requests no worker serves,
+// and the totals follow from them
+func TestRegularThreadCalculation(t *testing.T) {
+	oneWorkerThread := []workerOpt{{num: 1}}
+
+	testThreadCalculation(t, 3, 3, &opt{numRegularThreads: 3})
+	testThreadCalculation(t, 4, 4, &opt{numRegularThreads: 3, workers: oneWorkerThread})
+	testThreadCalculation(t, 4, 9, &opt{numRegularThreads: 3, maxRegularThreads: 8, workers: oneWorkerThread})
+
+	// every worker keeps its own limit on top of the regular ones
+	testThreadCalculation(t, 4, 12, &opt{numRegularThreads: 3, maxRegularThreads: 8, workers: []workerOpt{{num: 1, maxThreads: 4}}})
+
+	// auto stays the memory heuristic of the total
+	testThreadCalculation(t, 4, -1, &opt{numRegularThreads: 3, maxRegularThreads: -1, workers: oneWorkerThread})
+
+	// the regular forms and the totals are two ways to say the same thing
+	testThreadCalculationError(t, &opt{numThreads: 4, numRegularThreads: 3})
+	testThreadCalculationError(t, &opt{maxThreads: 4, maxRegularThreads: 3})
+	testThreadCalculationError(t, &opt{numRegularThreads: 0 - 1})
+	testThreadCalculationError(t, &opt{numRegularThreads: 4, maxRegularThreads: 3})
+}
+
 func testThreadCalculation(t *testing.T, expectedNumThreads int, expectedMaxThreads int, o *opt) {
 	t.Helper()
 

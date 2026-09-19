@@ -242,6 +242,37 @@ func calculateMaxThreads(opt *opt) (numWorkers int, _ error) {
 		}
 	}
 
+	// the regular forms say how many threads serve the requests no worker
+	// serves, so the totals are derived instead of being divided by hand
+	if opt.numRegularThreads != 0 {
+		if opt.numThreads > 0 {
+			return 0, errors.New("num_threads and num_regular_threads cannot be set together")
+		}
+		if opt.numRegularThreads < 1 {
+			return 0, fmt.Errorf("num_regular_threads (%d) must be at least 1", opt.numRegularThreads)
+		}
+
+		opt.numThreads = opt.numRegularThreads + numWorkers
+	}
+
+	if opt.maxRegularThreads != 0 {
+		if opt.maxThreads != 0 {
+			return 0, errors.New("max_threads and max_regular_threads cannot be set together")
+		}
+
+		if opt.maxRegularThreads < 0 {
+			// auto: the memory heuristic applies to the total, see setAutomaticMaxThreads()
+			opt.maxThreads = opt.maxRegularThreads
+		} else {
+			if opt.numRegularThreads > 0 && opt.maxRegularThreads < opt.numRegularThreads {
+				return 0, fmt.Errorf("max_regular_threads (%d) must be greater than or equal to num_regular_threads (%d)", opt.maxRegularThreads, opt.numRegularThreads)
+			}
+
+			// every worker keeps its own limit, the regular threads theirs
+			opt.maxThreads = opt.maxRegularThreads + numWorkers + maxThreadsFromWorkers
+		}
+	}
+
 	numThreadsIsSet := opt.numThreads > 0
 	maxThreadsIsSet := opt.maxThreads != 0
 	maxThreadsIsAuto := opt.maxThreads < 0 // maxthreads < 0 signifies auto mode (see phpmaintread.go)

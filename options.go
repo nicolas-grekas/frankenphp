@@ -26,17 +26,19 @@ type ServerOption func(*Server) error
 type opt struct {
 	hotReloadOpt
 
-	ctx         context.Context
-	numThreads  int
-	maxThreads  int
-	workers     []workerOpt
-	logger      *slog.Logger
-	metrics     Metrics
-	phpIni      map[string]string
-	maxWaitTime time.Duration
-	maxIdleTime time.Duration
-	maxRequests int
-	servers     []*Server
+	ctx               context.Context
+	numThreads        int
+	maxThreads        int
+	numRegularThreads int
+	maxRegularThreads int
+	workers           []workerOpt
+	logger            *slog.Logger
+	metrics           Metrics
+	phpIni            map[string]string
+	maxWaitTime       time.Duration
+	maxIdleTime       time.Duration
+	maxRequests       int
+	servers           []*Server
 }
 
 type workerOpt struct {
@@ -80,6 +82,28 @@ func WithNumThreads(numThreads int) Option {
 func WithMaxThreads(maxThreads int) Option {
 	return func(o *opt) error {
 		o.maxThreads = maxThreads
+
+		return nil
+	}
+}
+
+// WithNumRegularThreads configures the number of PHP threads to start for
+// regular requests, the ones no worker serves. Worker threads come on top of
+// it, where WithNumThreads counts them in.
+func WithNumRegularThreads(numRegularThreads int) Option {
+	return func(o *opt) error {
+		o.numRegularThreads = numRegularThreads
+
+		return nil
+	}
+}
+
+// WithMaxRegularThreads limits how many threads for regular requests can be
+// started at runtime, the workers' own limits coming on top of it. A negative
+// value derives the limit from the memory available, as WithMaxThreads does.
+func WithMaxRegularThreads(maxRegularThreads int) Option {
+	return func(o *opt) error {
+		o.maxRegularThreads = maxRegularThreads
 
 		return nil
 	}
