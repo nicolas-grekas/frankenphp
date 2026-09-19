@@ -1,0 +1,32 @@
+---
+name: Bench task channels
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bench-chan
+permissions:
+  contents: read
+jobs:
+  chan:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: cc -O2 -Wall -o chanbench bench/chanbench.c -lpthread
+      - name: Run
+        run: |
+          {
+            echo "## ${{ matrix.os }} ($(uname -sm), $(getconf _NPROCESSORS_ONLN) cpus)"
+            echo '```'
+            ./chanbench 20000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ./chanbench 20000
