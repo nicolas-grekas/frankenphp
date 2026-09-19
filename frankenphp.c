@@ -1653,6 +1653,32 @@ static void frankenphp_task_settle(frankenphp_task_data *data) {
   }
 }
 
+/* Recycled per thread: a task allocates its state once, then reuses the
+ * one its predecessor freed, since a run goes through many of them and
+ * they all have the same size. Bounded so a burst does not hold memory. */
+#define FRANKENPHP_TASK_DATA_POOL_MAX 32
+static THREAD_LOCAL frankenphp_task_data *frankenphp_task_data_pool = NULL;
+static THREAD_LOCAL unsigned frankenphp_task_data_pooled = 0;
+
+static frankenphp_task_data *frankenphp_task_data_new(void) {
+  frankenphp_task_data *data = frankenphp_task_data_pool;
+
+  if (data != NULL) {
+    /* the free list threads through the payload slot of a dead entry */
+    frankenphp_task_data_pool = (frankenphp_task_data *)Z_PTR(data->payload);
+    --frankenphp_task_data_pooled;
+    memset(data, 0, sizeof(*data));
+  } else {
+    data = pecalloc(1, sizeof(*data), 1);
+  }
+
+  data->timeout_ms = -1;
+  data->refs = 1;
+  ZVAL_UNDEF(&data->payload);
+
+  return data;
+}
+
 /* The state outlives whichever of the handle and the stream goes first. */
 static void frankenphp_task_data_release(frankenphp_task_data *data) {
   if (--data->refs > 0) {
@@ -1660,7 +1686,14 @@ static void frankenphp_task_data_release(frankenphp_task_data *data) {
   }
 
   zval_ptr_dtor(&data->payload);
-  efree(data);
+  if (frankenphp_task_data_pooled < FRANKENPHP_TASK_DATA_POOL_MAX) {
+    ZVAL_PTR(&data->payload, frankenphp_task_data_pool);
+    frankenphp_task_data_pool = data;
+    ++frankenphp_task_data_pooled;
+
+    return;
+  }
+  pefree(data, 1);
 }
 
 /* The stream a script took for this side, NULL when it took none or
@@ -1862,12 +1895,8 @@ static frankenphp_handle_ops frankenphp_task_poll_ops = {
 static zend_object *frankenphp_task_handle_new(zend_class_entry *ce) {
   zend_object *object =
       frankenphp_handle_obj_create(ce, &frankenphp_task_poll_ops);
-  frankenphp_task_data *data = ecalloc(1, sizeof(*data));
 
-  data->timeout_ms = -1;
-  data->refs = 1;
-  ZVAL_UNDEF(&data->payload);
-  FRANKENPHP_HANDLE_OF(object)->handle_data = data;
+  FRANKENPHP_HANDLE_OF(object)->handle_data = frankenphp_task_data_new();
 
   return object;
 }
