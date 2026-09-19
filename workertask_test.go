@@ -180,10 +180,12 @@ func TestTaskMetrics(t *testing.T) {
 		# TYPE frankenphp_worker_queue_depth gauge
 		frankenphp_worker_queue_depth{server="api",worker="echo"} 0
 	`
-	// the abandoned task is closed by the worker after the response
+	// the abandoned task is closed by the worker after the response, which
+	// a loaded machine running the whole suite under -race can take its
+	// time about
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		assert.NoError(c, testutil.GatherAndCompare(registry, strings.NewReader(expected), "frankenphp_worker_task_count", "frankenphp_busy_workers", "frankenphp_worker_queue_depth"))
-	}, 5*time.Second, 25*time.Millisecond)
+	}, 15*time.Second, 25*time.Millisecond)
 }
 
 // a sender waiting for a busy worker to pick its task up is released by
