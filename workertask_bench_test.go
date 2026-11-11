@@ -21,16 +21,15 @@ type taskBenchResult struct {
 	PerTaskNs int `json:"per_task_ns"`
 	SendNs    int `json:"send_ns"`
 	ReadNs    int `json:"read_ns"`
-	CgoCallNs int `json:"cgo_call_ns"`
+	PickupNs  int `json:"pickup_ns"`
 	Worker    *struct {
-		Tasks        int `json:"tasks"`
-		Wakeups      int `json:"wakeups"`
-		EmptyWakeups int `json:"empty_wakeups"`
-		ReceiveNs    int `json:"receive_ns"`
-		UpdateNs     int `json:"update_ns"`
-		CompleteNs   int `json:"complete_ns"`
-		WakeNs       int `json:"wake_ns"`
-		PickupNs     int `json:"pickup_ns"`
+		Tasks        int  `json:"tasks"`
+		Waits        bool `json:"waits"`
+		Wakeups      int  `json:"wakeups"`
+		EmptyWakeups int  `json:"empty_wakeups"`
+		ReceiveNs    int  `json:"receive_ns"`
+		UpdateNs     int  `json:"update_ns"`
+		CompleteNs   int  `json:"complete_ns"`
 	} `json:"worker"`
 }
 
@@ -49,7 +48,9 @@ func taskBenchRequest(b *testing.B, server *frankenphp.Server, query string) tas
 	return r
 }
 
-func initTaskBench(b *testing.B, num, numThreads int) *frankenphp.Server {
+// receive picks how the worker waits for its tasks: "wait" in receive() where
+// the build has it, anything else on its stream
+func initTaskBench(b *testing.B, num, numThreads int, receive string) *frankenphp.Server {
 	b.Helper()
 	server, err := frankenphp.NewServer(testDataDir)
 	if err != nil {
@@ -57,7 +58,12 @@ func initTaskBench(b *testing.B, num, numThreads int) *frankenphp.Server {
 	}
 	if err := frankenphp.Init(
 		frankenphp.WithServer(server),
-		frankenphp.WithWorkers("echo", "testdata/bgworker/task-bench-worker.php", num, frankenphp.WithWorkerBackground(), frankenphp.WithWorkerServerScope(server)),
+		frankenphp.WithWorkers("echo", "testdata/bgworker/task-bench-worker.php", num,
+			frankenphp.WithWorkerBackground(),
+			frankenphp.WithWorkerServerScope(server),
+			frankenphp.WithWorkerTasks("echo"),
+			frankenphp.WithWorkerEnv(map[string]string{"BG_RECEIVE": receive}),
+		),
 		frankenphp.WithNumThreads(numThreads),
 	); err != nil {
 		b.Fatal(err)
@@ -67,25 +73,20 @@ func initTaskBench(b *testing.B, num, numThreads int) *frankenphp.Server {
 	return server
 }
 
-func BenchmarkTask(b *testing.B) {
+func benchmarkTask(b *testing.B, receive string) {
 	for _, tc := range []struct {
 		name  string
 		num   int
 		query string
 	}{
 		{"num=1", 1, ""},
-		{"num=2", 2, ""},
 		{"num=4", 4, ""},
-		{"num=8", 8, ""},
-		{"size=4KB", 1, "&size=4096"},
 		{"size=64KB", 1, "&size=65536"},
-		{"size=1MB", 1, "&size=1048576"},
 		{"elements=1000", 1, "&elements=1000"},
-		{"updates=4", 1, "&updates=4"},
 		{"updates=16", 1, "&updates=16"},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			server := initTaskBench(b, tc.num, 1)
+			server := initTaskBench(b, tc.num, 1, receive)
 			// warm up the worker and opcache
 			taskBenchRequest(b, server, "n=100"+tc.query)
 			b.ResetTimer()
@@ -93,33 +94,33 @@ func BenchmarkTask(b *testing.B) {
 			b.StopTimer()
 			b.ReportMetric(float64(r.SendNs), "send-ns/task")
 			b.ReportMetric(float64(r.ReadNs), "read-ns/task")
-			b.ReportMetric(float64(r.CgoCallNs), "cgo-call-ns")
+			b.ReportMetric(float64(r.PickupNs), "pickup-ns/task")
 			if r.Worker != nil {
-				b.ReportMetric(float64(r.Worker.WakeNs), "worker-wake-ns/task")
-				b.ReportMetric(float64(r.Worker.PickupNs), "pickup-ns/task")
-				b.ReportMetric(float64(r.Worker.ReceiveNs), "receive-ns/task")
 				b.ReportMetric(float64(r.Worker.UpdateNs), "update-ns/task")
 				b.ReportMetric(float64(r.Worker.CompleteNs), "complete-ns/task")
-				b.ReportMetric(float64(r.Worker.EmptyWakeups)/float64(r.Worker.Tasks), "empty-wakeups/task")
 			}
 		})
 	}
 }
 
-// BenchmarkTaskConcurrent hammers a pool from several request threads at
-// once; ns/op is per request of 100 tasks, tasks/s is the throughput, the
-// other metrics are averages over all the tasks
-func BenchmarkTaskConcurrent(b *testing.B) {
-	for _, tc := range []struct{ senders, num int }{{1, 1}, {4, 4}, {8, 8}, {8, 16}, {16, 8}, {16, 16}} {
+// BenchmarkTask: the worker waits on its stream between two tasks
+func BenchmarkTask(b *testing.B) { benchmarkTask(b, "stream") }
+
+// BenchmarkTaskWait: the worker waits in receive(), where the build has it
+func BenchmarkTaskWait(b *testing.B) { benchmarkTask(b, "wait") }
+
+// ns/op is per request of 100 tasks, tasks/s is the throughput, the other
+// metrics are averages over all the tasks
+func benchmarkTaskConcurrent(b *testing.B, receive string) {
+	for _, tc := range []struct{ senders, num int }{{1, 1}, {4, 4}, {8, 8}, {16, 8}} {
 		b.Run(fmt.Sprintf("senders=%d/num=%d", tc.senders, tc.num), func(b *testing.B) {
-			server := initTaskBench(b, tc.num, tc.senders)
+			server := initTaskBench(b, tc.num, tc.senders, receive)
 			taskBenchRequest(b, server, "n=100")
 			b.ResetTimer()
 			var (
-				wg                                    sync.WaitGroup
-				mu                                    sync.Mutex
-				sendNs, readNs, pickupNs, wakeNs, cnt float64
-				last                                  taskBenchResult
+				wg                          sync.WaitGroup
+				mu                          sync.Mutex
+				sendNs, readNs, pickup, cnt float64
 			)
 			requests := make(chan struct{}, b.N)
 			for range b.N {
@@ -133,11 +134,7 @@ func BenchmarkTaskConcurrent(b *testing.B) {
 						mu.Lock()
 						sendNs += float64(r.SendNs)
 						readNs += float64(r.ReadNs)
-						if r.Worker != nil {
-							pickupNs += float64(r.Worker.PickupNs)
-							wakeNs += float64(r.Worker.WakeNs)
-							last = r
-						}
+						pickup += float64(r.PickupNs)
 						cnt++
 						mu.Unlock()
 					}
@@ -148,54 +145,25 @@ func BenchmarkTaskConcurrent(b *testing.B) {
 			b.ReportMetric(float64(b.N*100)/b.Elapsed().Seconds(), "tasks/s")
 			b.ReportMetric(sendNs/cnt, "send-ns/task")
 			b.ReportMetric(readNs/cnt, "read-ns/task")
-			if last.Worker != nil {
-				b.ReportMetric(pickupNs/cnt, "pickup-ns/task")
-				b.ReportMetric(wakeNs/cnt, "worker-wake-ns/task")
-				b.ReportMetric(float64(last.Worker.EmptyWakeups)/float64(last.Worker.Tasks), "empty-wakeups/task")
-			}
+			b.ReportMetric(pickup/cnt, "pickup-ns/task")
 		})
 	}
 }
 
-// BenchmarkTaskBaselineConcurrent is the cost of plain requests under the
-// same concurrency as the task benchmarks: the environment's own wake-up
-// cost under load
-func BenchmarkTaskBaselineConcurrent(b *testing.B) {
-	for _, senders := range []int{1, 4, 8, 16} {
-		b.Run(fmt.Sprintf("senders=%d", senders), func(b *testing.B) {
-			server := initTaskBench(b, 1, senders)
-			b.ResetTimer()
-			var wg sync.WaitGroup
-			requests := make(chan struct{}, b.N)
-			for range b.N {
-				requests <- struct{}{}
-			}
-			close(requests)
-			for range senders {
-				wg.Go(func() {
-					for range requests {
-						w := httptest.NewRecorder()
-						if err := server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/vars.php?name=echo", nil)); err != nil {
-							b.Error(err)
-						}
-					}
-				})
-			}
-			wg.Wait()
-			b.StopTimer()
-			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "req/s")
-		})
-	}
-}
+// BenchmarkTaskConcurrent hammers a pool from several request threads at once
+func BenchmarkTaskConcurrent(b *testing.B) { benchmarkTaskConcurrent(b, "stream") }
+
+// BenchmarkTaskConcurrentWait is the same with workers waiting in receive()
+func BenchmarkTaskConcurrentWait(b *testing.B) { benchmarkTaskConcurrent(b, "wait") }
 
 // BenchmarkTaskBaseline is the cost of a request to a trivial script, for
 // scale
 func BenchmarkTaskBaseline(b *testing.B) {
-	server := initTaskBench(b, 1, 1)
+	server := initTaskBench(b, 1, 1, "stream")
 	b.ResetTimer()
 	for range b.N {
 		w := httptest.NewRecorder()
-		if err := server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/vars.php?name=echo", nil)); err != nil {
+		if err := server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/index.php", nil)); err != nil {
 			b.Fatal(err)
 		}
 	}

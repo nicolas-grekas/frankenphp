@@ -8,7 +8,10 @@ on:
         default: bgworker-tasks
       b:
         description: ref B
-        default: bgworker-tasks-perf
+        default: bgworker-tasks-mailbox-step1
+      c:
+        description: ref C, optional
+        default: bgworker-tasks-mailbox
       rounds:
         description: rounds
         default: "4"
@@ -22,7 +25,7 @@ env:
   GOFLAGS: "-tags=nobadger,nomysql,nopgx,nowatcher"
 jobs:
   ab:
-    name: A/B ${{ inputs.a || 'bgworker-tasks' }} vs ${{ inputs.b || 'bgworker-tasks-lazy' }}
+    name: A/B ${{ inputs.a || 'bgworker-tasks' }} vs ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }} vs ${{ inputs.c || 'bgworker-tasks-mailbox' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,8 +38,13 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.b || 'bgworker-tasks-lazy' }}
+          ref: ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }}
           path: side-b
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.c || 'bgworker-tasks-mailbox' }}
+          path: side-c
           persist-credentials: false
       - uses: ./.github/actions/setup-go
         with:
@@ -56,4 +64,4 @@ jobs:
       - name: Machine
         run: nproc; lscpu | grep -E 'Model name|Hypervisor' || true
       - name: A/B
-        run: bench/ab.sh "$PWD/side-a" "$PWD/side-b" "${{ inputs.rounds || '4' }}"
+        run: bench/ab.sh "${{ inputs.rounds || '4' }}" "base=$PWD/side-a" "mailbox=$PWD/side-b" "queue=$PWD/side-c"
