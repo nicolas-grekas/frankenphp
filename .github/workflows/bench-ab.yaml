@@ -8,10 +8,10 @@ on:
         default: bgworker-tasks
       b:
         description: ref B
-        default: bgworker-tasks-mailbox-step1
+        default: bgworker-vars-cache
       c:
-        description: ref C
-        default: bgworker-tasks-mailbox
+        description: ref C, optional
+        default: ""
       d:
         description: ref D, optional
         default: ""
@@ -28,7 +28,7 @@ env:
   GOFLAGS: "-tags=nobadger,nomysql,nopgx,nowatcher"
 jobs:
   ab:
-    name: A/B ${{ inputs.a || 'bgworker-tasks' }} vs ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }} vs ${{ inputs.c || 'bgworker-tasks-mailbox' }}
+    name: A/B ${{ inputs.a || 'bgworker-tasks' }} vs ${{ inputs.b || 'bgworker-vars-cache' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,12 +41,13 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }}
+          ref: ${{ inputs.b || 'bgworker-vars-cache' }}
           path: side-b
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.c != ''
         with:
-          ref: ${{ inputs.c || 'bgworker-tasks-mailbox' }}
+          ref: ${{ inputs.c }}
           path: side-c
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,10 +77,11 @@ jobs:
         env:
           ROUNDS: ${{ inputs.rounds || '4' }}
           REF_A: ${{ inputs.a || 'bgworker-tasks' }}
-          REF_B: ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }}
-          REF_C: ${{ inputs.c || 'bgworker-tasks-mailbox' }}
+          REF_B: ${{ inputs.b || 'bgworker-vars-cache' }}
+          REF_C: ${{ inputs.c }}
           REF_D: ${{ inputs.d }}
         run: |
-          sides=("${REF_A//\//-}=$PWD/side-a" "${REF_B//\//-}=$PWD/side-b" "${REF_C//\//-}=$PWD/side-c")
+          sides=("${REF_A//\//-}=$PWD/side-a" "${REF_B//\//-}=$PWD/side-b")
+          if [ -n "$REF_C" ]; then sides+=("${REF_C//\//-}=$PWD/side-c"); fi
           if [ -n "$REF_D" ]; then sides+=("${REF_D//\//-}=$PWD/side-d"); fi
           bench/ab.sh "$ROUNDS" "${sides[@]}"
