@@ -109,6 +109,30 @@ func BenchmarkTask(b *testing.B) { benchmarkTask(b, "stream") }
 // BenchmarkTaskWait: the worker waits in receive(), where the build has it
 func BenchmarkTaskWait(b *testing.B) { benchmarkTask(b, "wait") }
 
+// ns/op is per batch of k tasks, sent to a pool of k threads before the first
+// one is read
+func benchmarkTaskFanOut(b *testing.B, receive string) {
+	for _, k := range []int{4} {
+		b.Run(fmt.Sprintf("k=%d", k), func(b *testing.B) {
+			server := initTaskBench(b, k, 1, receive)
+			query := "&fanout=" + strconv.Itoa(k)
+			taskBenchRequest(b, server, "n=100"+query)
+			b.ResetTimer()
+			r := taskBenchRequest(b, server, "n="+strconv.Itoa(b.N)+query)
+			b.StopTimer()
+			b.ReportMetric(float64(r.SendNs), "send-ns/task")
+			b.ReportMetric(float64(r.ReadNs), "read-ns/task")
+			b.ReportMetric(float64(r.PickupNs), "pickup-ns/task")
+		})
+	}
+}
+
+// BenchmarkTaskFanOut sends a batch of tasks to a pool, then reads them all
+func BenchmarkTaskFanOut(b *testing.B) { benchmarkTaskFanOut(b, "stream") }
+
+// BenchmarkTaskFanOutWait is the same with workers waiting in receive()
+func BenchmarkTaskFanOutWait(b *testing.B) { benchmarkTaskFanOut(b, "wait") }
+
 // ns/op is per request of 100 tasks, tasks/s is the throughput, the other
 // metrics are averages over all the tasks
 func benchmarkTaskConcurrent(b *testing.B, receive string) {

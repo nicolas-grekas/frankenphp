@@ -10,8 +10,11 @@ on:
         description: ref B
         default: bgworker-tasks-mailbox-step1
       c:
-        description: ref C, optional
+        description: ref C
         default: bgworker-tasks-mailbox
+      d:
+        description: ref D, optional
+        default: ""
       rounds:
         description: rounds
         default: "4"
@@ -46,6 +49,12 @@ jobs:
           ref: ${{ inputs.c || 'bgworker-tasks-mailbox' }}
           path: side-c
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.d != ''
+        with:
+          ref: ${{ inputs.d }}
+          path: side-d
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
         with:
           working-directory: side-a
@@ -64,4 +73,13 @@ jobs:
       - name: Machine
         run: nproc; lscpu | grep -E 'Model name|Hypervisor' || true
       - name: A/B
-        run: bench/ab.sh "${{ inputs.rounds || '4' }}" "base=$PWD/side-a" "mailbox=$PWD/side-b" "queue=$PWD/side-c"
+        env:
+          ROUNDS: ${{ inputs.rounds || '4' }}
+          REF_A: ${{ inputs.a || 'bgworker-tasks' }}
+          REF_B: ${{ inputs.b || 'bgworker-tasks-mailbox-step1' }}
+          REF_C: ${{ inputs.c || 'bgworker-tasks-mailbox' }}
+          REF_D: ${{ inputs.d }}
+        run: |
+          sides=("${REF_A//\//-}=$PWD/side-a" "${REF_B//\//-}=$PWD/side-b" "${REF_C//\//-}=$PWD/side-c")
+          if [ -n "$REF_D" ]; then sides+=("${REF_D//\//-}=$PWD/side-d"); fi
+          bench/ab.sh "$ROUNDS" "${sides[@]}"
