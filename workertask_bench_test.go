@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/dunglas/frankenphp"
 )
@@ -46,6 +48,14 @@ func taskBenchRequest(b *testing.B, server *frankenphp.Server, query string) tas
 	}
 
 	return r
+}
+
+// cpuTime is the CPU time the process used so far, all threads included
+func cpuTime() time.Duration {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
 // receive picks how the worker waits for its tasks: "wait" in receive() where
@@ -90,15 +100,43 @@ func benchmarkTask(b *testing.B, receive string) {
 			// warm up the worker and opcache
 			taskBenchRequest(b, server, "n=100"+tc.query)
 			b.ResetTimer()
+			cpu := cpuTime()
 			r := taskBenchRequest(b, server, "n="+strconv.Itoa(b.N)+tc.query)
+			cpu = cpuTime() - cpu
 			b.StopTimer()
 			b.ReportMetric(float64(r.SendNs), "send-ns/task")
 			b.ReportMetric(float64(r.ReadNs), "read-ns/task")
 			b.ReportMetric(float64(r.PickupNs), "pickup-ns/task")
+			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/task")
 			if r.Worker != nil {
 				b.ReportMetric(float64(r.Worker.UpdateNs), "update-ns/task")
 				b.ReportMetric(float64(r.Worker.CompleteNs), "complete-ns/task")
 			}
+		})
+	}
+}
+
+// BenchmarkTaskWorkWait gives the worker CPU work to do per task: the sender
+// waits that long for its answer, whether it sleeps or keeps a core busy
+// meanwhile shows in cpu-ns/task. mix alternates tasks with and without work
+func BenchmarkTaskWorkWait(b *testing.B) {
+	for _, tc := range []struct{ name, query string }{
+		{"work=100us", "&work_us=100"},
+		{"work=1ms", "&work_us=1000"},
+		{"mix=0+200us", "&work_us=200&mix=1"},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			server := initTaskBench(b, 1, 1, "wait")
+			taskBenchRequest(b, server, "n=100"+tc.query)
+			b.ResetTimer()
+			cpu := cpuTime()
+			r := taskBenchRequest(b, server, "n="+strconv.Itoa(b.N)+tc.query)
+			cpu = cpuTime() - cpu
+			b.StopTimer()
+			b.ReportMetric(float64(r.SendNs), "send-ns/task")
+			b.ReportMetric(float64(r.ReadNs), "read-ns/task")
+			b.ReportMetric(float64(r.PickupNs), "pickup-ns/task")
+			b.ReportMetric(float64(cpu.Nanoseconds())/float64(b.N), "cpu-ns/task")
 		})
 	}
 }

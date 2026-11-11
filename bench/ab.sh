@@ -10,7 +10,7 @@ for pair in "$@"; do
   for f in $HARNESS; do mkdir -p "$dir/$(dirname "$f")"; cp "$f" "$dir/$f"; done
   (cd "$dir" && go test -c -o "/tmp/$label.test" .)
 done
-BENCH='^BenchmarkTask(Wait)?$/^(num=1|updates=16)$|^BenchmarkTaskFanOut(Wait)?$|^BenchmarkTaskConcurrent(Wait)?$/^senders=(1|4|8|16)$/^num=(1|4|8)$'
+BENCH='^BenchmarkTask(Wait)?$/^(num=1|updates=16)$|^BenchmarkTaskFanOut(Wait)?$|^BenchmarkTaskWorkWait$|^BenchmarkTaskConcurrent(Wait)?$/^senders=(1|4|8|16)$/^num=(1|4|8)$'
 : > /tmp/results.txt
 for r in $(seq 1 "$ROUNDS"); do
   for pair in "$@"; do
@@ -32,7 +32,7 @@ for line in open("/tmp/results.txt"):
     m = re.search(r"\s(\d+) ns/op", line)
     t = re.search(r"([\d.]+) tasks/s", line)
     acc[(name, side)].append(float(t.group(1)) if t else int(m.group(1)) / 1000)
-    for v, k in re.findall(r"([\d.]+) ((?:send|read|pickup)-ns/task)", line):
+    for v, k in re.findall(r"([\d.]+) ((?:send|read|pickup|cpu)-ns/task)", line):
         extra[(name, side)][k].append(float(v) / 1000)
 print("| benchmark | " + " | ".join(sides) + " |")
 print("|---|" + "---|" * len(sides))
@@ -53,6 +53,8 @@ for name in sorted({k[0] for k in acc}):
         e = extra.get((name, s), {})
         if e and not throughput:
             cell += " [send %.1f, read %.1f, pickup %.1f]" % tuple(sum(e[k]) / len(e[k]) for k in ("send-ns/task", "read-ns/task", "pickup-ns/task"))
+            if "cpu-ns/task" in e:
+                cell += " cpu %.1f" % (sum(e["cpu-ns/task"]) / len(e["cpu-ns/task"]))
         row.append(cell)
     print("| %s | %s |" % (name.replace("Benchmark", ""), " | ".join(row)))
 PY

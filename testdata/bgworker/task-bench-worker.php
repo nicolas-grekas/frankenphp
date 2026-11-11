@@ -1,8 +1,8 @@
 <?php
 
 // Bg worker of the benchmarks: answers each task with the number of updates
-// its payload asks for, the last one echoing the payload back with the time
-// of its pickup, and answers a "stats" task with the average per-call timings
+// its payload asks for, after work_us microseconds of CPU work when it asks
+// for some, the last one echoing the payload back with the time of its pickup, and answers a "stats" task with the average per-call timings
 // (ns) of the thread that took it. wakeups counts the wake-ups it waited for,
 // empty_wakeups those that found no task (a pool sibling took it).
 // BG_RECEIVE=wait makes it wait in receive() where that exists, instead of
@@ -29,6 +29,11 @@ $work = static function (\FrankenPHP\ReceivedTaskHandle $task, int $t0) use (&$t
         ]);
 
         return;
+    }
+    if (!empty($payload['work_us'])) {
+        // CPU work, not a sleep: the thread stays on its core
+        for ($until = hrtime(true) + 1000 * $payload['work_us']; hrtime(true) < $until;) {
+        }
     }
     for ($i = 1, $updates = $payload['updates'] ?? 1; $i < $updates; ++$i) {
         $task->update(['i' => $i]);

@@ -16,6 +16,10 @@ if ($size = (int) ($_GET['size'] ?? 0)) {
 if ($elements = (int) ($_GET['elements'] ?? 0)) {
     $payload['elements'] = range(1, $elements);
 }
+// work_us of CPU work per task on the worker's side, for every task or, with
+// mix, for every other one
+$work = (int) ($_GET['work_us'] ?? 0);
+$mix = isset($_GET['mix']);
 // fanout tasks are sent before the first one is read, to as many threads
 $fanout = max(1, (int) ($_GET['fanout'] ?? 1));
 $send = $read = $pickup = 0.0;
@@ -23,6 +27,7 @@ $start = hrtime(true);
 for ($i = 0; $i < $n; ++$i) {
     $t0 = hrtime(true);
     $payload['sent_at'] = $t0;
+    $payload['work_us'] = $mix && $i % 2 ? 0 : $work;
     $tasks = [];
     for ($k = 0; $k < $fanout; ++$k) {
         $tasks[] = new \FrankenPHP\SentTaskHandle($ns, $payload);
